@@ -1,0 +1,2499 @@
+---
+title: "midas_models_v0"
+format: html
+editor: source
+---
+
+```{r globalopt, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, cache = F)
+```
+
+## packages
+
+```{r include=FALSE}
+require(tidyverse)
+require(kableExtra)
+require(parallel)
+require(data.table)
+require(INLA)
+
+require(geosphere)
+require(ggregplot)
+require(RColorBrewer)
+require(ggsci)
+require(gstat)
+require(sp)
+require(spacetime)
+require(sf)
+require(inlabru)
+# require(fitdistrplus)
+require(qmap)
+require(plotly)
+
+require(rnaturalearth)
+
+require(fields)
+require(reshape2)
+```
+
+```{r}
+# Set the theme for all plots
+theme_set(theme_bw())
+```
+
+## Functions
+
+```{r}
+mc <- detectCores()-2
+# list.files("~/OneDrive")
+source("~/OneDrive/kablefunction.R")
+source("helper_functions.R")
+```
+
+## Data
+
+```{r}
+
+# midas clean
+# Define the path to the directory containing the file
+data_path <- "~/Documents/MIDAS"
+annual.rev.path <- "../../1st_annual_review/Sergio---Annual-Review-Report---2024/fig2_calib/"
+yearsel <- 2022
+calib.fname <- file.path(
+  data_path,
+  sprintf("calib_data_%04d.csv",yearsel))
+
+# Read processed data
+midas_clean <- fread(calib.fname)
+
+# station meta data: location, elevation, average bias, ..
+
+stations.meta.fname <- file.path(data_path,"stations_meta.csv")
+stations.meta <- fread(stations.meta.fname)
+
+process_data(midas_clean, hour)
+process_data(midas_clean, quarter)
+
+```
+
+```{r}
+midas_clean %>% dplyr::select(Longitude,Latitude,OB_TIME,WIND_SPEED)
+```
+
+
+## Bias group
+
+```{r}
+station.summary <- midas_clean %>% 
+  group_by(Area,Name,SRC_ID) %>% 
+  summarise(
+    across(c(WIND_SPEED,eraws10),mean),
+    mean = mean(bias),
+    # mean.pc = ifelse(WIND_SPEED>0,mean(bias/WIND_SPEED),NA),
+    abs.mean = abs(mean(bias)),
+    sd = sd(bias),
+    .groups = "drop")
+# view(station.summary)
+
+
+## group threshold
+bias.threshold <- 2
+
+bias.stat.plot <- station.summary %>% 
+  ggplot(aes(mean,sd, text = paste("Station:",Name, " - ", Area)))+
+  geom_point(col="darkblue")+
+  labs(title = "Bias statistics by station")+
+  xlab("Mean Bias")+ylab("Std. dev. of Bias")+
+  geom_vline(xintercept = bias.threshold, col = "darkred", lty = 2)+
+  scale_x_continuous(n.breaks = 8)+
+  scale_y_continuous(n.breaks = 6)
+
+# Convert ggplot to plotly
+p <- ggplotly(bias.stat.plot, tooltip = "text") %>%
+  style(
+    hoverinfo = "none",  # Disable default hover info
+    hovertemplate = paste(
+      "Bias mean: %{x:.2f}<br>",  # Format x with 2 decimal places
+      "Bias std. dev.: %{y:.2f}<br>",  # Format y with 2 decimal places
+      "%{text}<extra></extra>"
+    ),
+    traces = 1  # Apply style to the first trace
+  )
+
+# Display the plot
+p
+
+station.summary <- 
+  station.summary %>% 
+  mutate(bias.g = ifelse(mean<bias.threshold,0,1)) %>% 
+  left_join(
+    stations.meta %>% dplyr::select(src_id,elevation),
+    by = c("SRC_ID"="src_id")
+  )
+ggsave(filename = file.path(annual.rev.path,"bias_threhold.png"),bias.stat.plot)
+## SRC IDS reasonably well represented by ERA5
+ids.0 <- station.summary$SRC_ID[station.summary$bias.g==0]
+```
+
+## Scatter plots
+
+```{r}
+midas_clean2 <- midas_clean %>% 
+  filter(SRC_ID %in% ids.0)
+```
+
+```{r}
+one.station.scatter(midas_clean2,station.table = stations.meta, station.id = 19260, p.col = "darkblue",alpha=0.5)
+one.station.ts(midas_clean2,station.table = stations.meta, station.id = 19260,roll.window.hr = 72)
+one.station.ts(midas_clean2,station.table = stations.meta, station.id = 19260,roll.window.hr = 1, group.var = TRUE)
+```
+
+```{r}
+set.seed(0)
+one.time <- "2022-04-12 14:00:00" %>% 
+  as.POSIXct()
+# One point in time
+yravg <- midas_clean2 %>% 
+  # filter(SRC_ID==19260) %>% 
+  filter(OB_TIME==one.time) %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED,text = paste("Station:",Name, " - ", Area)))+
+  geom_point(col="darkblue")+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  # geom_text_repel(data = . %>% filter(WIND_SPEED > 9), aes(label = Name), color = "black",size=3)+
+  xlab("ERA5 wind speed")+ylab("MIDAS wind speed")+labs(title = paste0("Wind speed at ",format(one.time, "%H:%M, %d %b %y")))+
+  coord_fixed(ratio=1)+
+  theme_bw()
+
+ggplotly(yravg, tooltip = "text") %>%
+  style(
+    hoverinfo = "none",  # Disable default hover info
+    hovertemplate = paste(
+      "ERA5: %{x:.2f}<br>",  # Format x with 2 decimal places
+      "MIDAS: %{y:.2f}<br>",  # Format y with 2 decimal places
+      "%{text}<extra></extra>"
+    ),
+    traces = 1  # Apply style to the first trace
+  )
+```
+
+```{r}
+set.seed(0)
+# one.time <- "2022-04-12 14:00:00" %>% 
+#   as.POSIXct()
+# One point in time
+yravg <- midas_clean2 %>% 
+  # filter(SRC_ID==19260) %>% 
+  group_by(SRC_ID,Name,Area) %>% 
+  summarise(across(c(eraws10,WIND_SPEED),mean),.groups = "drop") %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED,text = paste("Station:",Name, " - ", Area)))+
+  geom_point(col="darkblue")+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  # geom_text_repel(data = . %>% filter(WIND_SPEED > 9), aes(label = Name), color = "black",size=3)+
+  xlab("ERA5 wind speed")+ylab("MIDAS wind speed")+labs(title = paste0("Wind speed comparison"))+
+  # coord_fixed(ratio=1)+
+  theme_bw()
+yravg
+ggplotly(yravg, tooltip = "text") %>%
+  style(
+    hoverinfo = "none",  # Disable default hover info
+    hovertemplate = paste(
+      "ERA5: %{x:.2f}<br>",  # Format x with 2 decimal places
+      "MIDAS: %{y:.2f}<br>",  # Format y with 2 decimal places
+      "%{text}<extra></extra>"
+    ),
+    traces = 1  # Apply style to the first trace
+  )
+```
+
+```{r}
+bias.ws <- station.summary %>% 
+  filter(SRC_ID %in% ids.0) %>% 
+  ggplot(aes(WIND_SPEED,mean,text = paste("Station:",Name, " - ", Area)))+
+  geom_point(col= "darkblue")+
+  geom_abline(intercept = 0,slope = 1, col ="darkred", lty =2)+
+  xlab("MIDAS wind speed")+ylab("Mean Bias")+labs(title = sprintf("Average bias vs mean wind speed per station. %04d",yearsel))
+  # coord_fixed(ratio=1, xlim = c(0,15),ylim = c(0,15))
+ggplotly(bias.ws,tooltip = "text") %>%
+  style(
+    hoverinfo = "none",  # Disable default hover info
+    hovertemplate = paste(
+      "MIDAS: %{x:.2f}<br>",  # Format x with 2 decimal places
+      "Mean Bias: %{y:.2f}<br>",  # Format y with 2 decimal places
+      "%{text}<extra></extra>"
+    ),
+    traces = 1  # Apply style to the first trace
+  )
+# set.seed(0)
+# midas_clean2 %>% 
+#   process_data(.,date) %>% 
+#   filter(SRC_ID %in% sample(ids.0, size =10)) %>%
+#   ggplot(aes(WIND_SPEED,bias))+
+#   geom_point(aes(col = SRC_ID))+
+#   theme(legend.position = "none")
+```
+
+```{r}
+bias.ws <- station.summary %>% 
+  filter(SRC_ID %in% ids.0) %>% 
+  ggplot(aes(eraws10,mean,text = paste("Station:",Name, " - ", Area)))+
+  geom_point(col= "darkblue")+
+  geom_abline(intercept = 0,slope = 1, col ="darkred", lty =2)+
+  xlab("ERA5 wind speed")+ylab("Mean Bias")+labs(title = sprintf("Average bias vs mean wind speed per station. %04d",yearsel))
+  # coord_fixed(ratio=1, xlim = c(0,15),ylim = c(0,15))
+ggplotly(bias.ws,tooltip = "text") %>%
+  style(
+    hoverinfo = "none",  # Disable default hover info
+    hovertemplate = paste(
+      "MIDAS: %{x:.2f}<br>",  # Format x with 2 decimal places
+      "Mean Bias: %{y:.2f}<br>",  # Format y with 2 decimal places
+      "%{text}<extra></extra>"
+    ),
+    traces = 1  # Apply style to the first trace
+  )
+```
+
+```{r}
+set.seed(0)
+tday.bias <- process_data(midas_clean2, hour) %>% 
+  filter(SRC_ID %in% sample(ids.0, size =10)) %>%
+  ggplot()+
+  geom_line(aes(tgroup , bias,colour = SRC_ID, group = SRC_ID, text = paste("Station:",Name, " - ", Area) ))+
+  theme(legend.position = "none")
+# Convert ggplot to plotly
+tday_bias_plotly <- ggplotly(tday.bias) %>%
+  layout(hovermode = "closest")
+# # Add JavaScript for hover effect
+# tday_bias_plotly <- tday_bias_plotly %>%
+#   htmlwidgets::onRender("
+#     function(el, x) {
+#       var originalColors = [];
+#       var originalWidths = [];
+#       
+#       el.on('plotly_hover', function(data) {
+#         var update = {
+#           'line.color': 'rgba(169,169,169,0.5)',
+#           'line.width': 1
+#         };
+# 
+#         for (var i = 0; i < data.points.length; i++) {
+#           originalColors[data.points[i].curveNumber] = data.points[i].fullData.line.color;
+#           originalWidths[data.points[i].curveNumber] = data.points[i].fullData.line.width;
+#         }
+#         
+#         Plotly.restyle(el, update);
+#         
+#         var hoverLineUpdate = {
+#           'line.color': 'rgba(169,169,169,1)',
+#           'line.width': 3
+#         };
+#         Plotly.restyle(el, hoverLineUpdate, data.points.map(pt => pt.curveNumber));
+#       });
+# 
+#       el.on('plotly_unhover', function(data) {
+#         var update = {
+#           'line.color': originalColors,
+#           'line.width': originalWidths
+#         };
+#         Plotly.restyle(el, update);
+#       });
+#     }
+#   ")
+
+# Render the plot
+tday_bias_plotly
+```
+
+```{r}
+set.seed(0)
+no.lines <- 50
+station.sample <- sample(ids.0, size = no.lines)
+# time of day
+midas_clean %>% 
+  filter(SRC_ID %in% station.sample) %>%
+  # filter(SRC_ID %in% ids.0) %>% 
+  mutate(frac.time = fractional.hours(OB_TIME)) %>% 
+  group_by(SRC_ID,frac.time) %>% 
+  summarise(bias = mean(bias), .groups = "drop") %>% 
+  ggplot()+
+  geom_line(aes(frac.time , bias, group = SRC_ID), col = "darkgray")+
+  theme(legend.position = "none")+xlab("time of day")+ylab("Bias")
+
+
+midas_clean %>% 
+  filter(SRC_ID %in% station.sample) %>%
+  # filter(SRC_ID %in% ids.0) %>% 
+  mutate(frac.time = fractional.hours(OB_TIME)) %>% 
+  group_by(SRC_ID,frac.time) %>% 
+  summarise(bias = mean(bias), .groups = "drop") %>% 
+  ggplot(aes(frac.time , bias))+
+  geom_point(col = "darkgray")+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "tp"))+
+  theme(legend.position = "none")
+ggsave(filename = file.path(annual.rev.path,"bias_tod.png"))
+
+midas_clean %>% 
+  filter(SRC_ID %in% station.sample) %>%
+  # filter(SRC_ID %in% ids.0) %>% 
+  mutate(frac.time = fractional.hours(OB_TIME)) %>% 
+  group_by(SRC_ID,frac.time) %>% 
+  summarise(sd = sd(bias), .groups = "drop") %>% 
+  ggplot()+
+  geom_line(aes(frac.time , sd, group = SRC_ID), col = "darkgray")+
+  theme(legend.position = "none")
+
+
+midas_clean %>% 
+  filter(SRC_ID %in% station.sample) %>%
+  # filter(SRC_ID %in% ids.0) %>% 
+  mutate(frac.time = fractional.hours(OB_TIME)) %>% 
+  group_by(SRC_ID,frac.time) %>% 
+  summarise(sd = sd(bias), .groups = "drop") %>% 
+  ggplot(aes(frac.time , sd))+
+  geom_point(col = "darkgray")+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "tp"))+
+  theme(legend.position = "none")
+ggsave(filename = file.path(annual.rev.path,"bias_sd_tod.png"))
+```
+
+```{r}
+
+yravg <- midas_clean2 %>% 
+  # filter(SRC_ID==19260) %>% 
+  group_by(SRC_ID,Name,Area) %>% 
+  summarise(across(c(eraws10,WIND_SPEED,bias),mean),.groups = "drop") %>% 
+  left_join(
+    stations.meta %>% dplyr::select(src_id,elevation),
+    by = c("SRC_ID"="src_id")
+  ) %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(elevation,bias,text = paste("Station:",Name, " - ", Area)))+
+  geom_point(col="darkblue")+
+  # geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  # geom_text_repel(data = . %>% filter(WIND_SPEED > 9), aes(label = Name), color = "black",size=3)+
+  xlab("Elevation")+ylab("Bias")+#labs(title = paste0("Wind speed comparison"))+
+  # coord_fixed(ratio=1)+
+  theme_bw()
+# yravg
+ggplotly(yravg, tooltip = "text") %>%
+  style(
+    hoverinfo = "none",  # Disable default hover info
+    hovertemplate = paste(
+      "ERA5: %{x:.2f}<br>",  # Format x with 2 decimal places
+      "MIDAS: %{y:.2f}<br>",  # Format y with 2 decimal places
+      "%{text}<extra></extra>"
+    ),
+    traces = 1  # Apply style to the first trace
+  )
+
+```
+
+```{r}
+# time of year
+
+set.seed(0)
+no.lines <- 50
+station.sample <- sample(ids.0, size = no.lines)
+# time of day
+# midas_clean %>% 
+#   filter(SRC_ID %in% station.sample) %>%
+#   # filter(SRC_ID %in% ids.0) %>% 
+#   mutate(frac.month = round(fractional.months(OB_TIME),1)) %>% 
+#   group_by(SRC_ID,frac.month) %>% 
+#   summarise(bias = mean(bias), .groups = "drop") %>% 
+#   ggplot()+
+#   geom_line(aes(frac.month , bias, group = SRC_ID), col = "darkgray")+
+#   theme(legend.position = "none")
+
+midas_clean %>% 
+  filter(SRC_ID %in% station.sample) %>%
+  # filter(SRC_ID %in% ids.0) %>% 
+  mutate(d = date(OB_TIME)) %>% 
+  group_by(SRC_ID,Area,Name, d) %>% 
+  summarise(bias = mean(bias), .groups = "drop") %>% 
+  ggplot(aes(d,bias))+
+  geom_point( col = "darkgray", alpha= 0.5)+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "tp"))+
+  theme(legend.position = "none")
+
+midas_clean %>% 
+  filter(SRC_ID %in% station.sample) %>%
+  # filter(SRC_ID %in% ids.0) %>% 
+  mutate(frac.month = round(fractional.months(OB_TIME),1)) %>% 
+  group_by(SRC_ID,frac.month) %>% 
+  summarise(bias = mean(bias), .groups = "drop") %>% 
+  ggplot(aes(x = frac.month , y =bias))+
+  geom_point( col = "darkgray", alpha= 0.5)+
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "tp"))+
+  theme(legend.position = "none")
+ggsave(filename = file.path(annual.rev.path,"bias_month.png"),bias.stat.plot)
+```
+
+## Correlation
+
+```{r}
+# midas_clean
+# 
+# # function to calculate correlation between stations
+# 
+# bias.corr <- midas_clean
+# 
+# 
+# id_comb <- midas_clean$SRC_ID %>% unique() %>% #extract unique list of IDs
+#   combn(., 2, simplify = FALSE) %>% # get all possible pairs
+#   # head() %>% 
+#   # lapply(., as.data.frame) %>% 
+#   do.call(rbind, .)
+# 
+# test <- id_comb %>% head()
+# 
+# 
+# 
+# midas_clean %>% 
+#   filter(SRC_ID %in% c("index1","index2")) %>% 
+#   pivot_wider(cols = SRC_ID) %>% 
+#   select("index1","index2") %>% 
+#   co
+
+```
+
+
+```{r}
+
+# get correlation matrix
+cor_matrix <- midas_clean %>% 
+  dplyr::select(OB_TIME,SRC_ID,bias) %>% 
+  pivot_wider(names_from = SRC_ID, values_from = bias) %>% # one station per column
+  dplyr::select(-OB_TIME) %>% #remove time index
+  cor(., use = "complete.obs", method = "pearson") # calculate correlation
+
+dist_matrix <- stations.meta %>% 
+  dplyr::select(Longitude,Latitude) %>% 
+  distm(., fun = \(...) distGeo(...)/1000)
+
+colnames(dist_matrix) <- stations.meta$src_id
+rownames(dist_matrix) <- stations.meta$src_id
+
+melt_similarity <- function(
+    simmatrix, 
+    var.name="similarity",
+    upper_tri = TRUE){
+  
+  if (upper_tri){
+    # Get the upper triangle of the correlation matrix without the diagonal
+    upper_triangle <- simmatrix
+    upper_triangle[lower.tri(upper_triangle, diag = TRUE)] <- NA
+  } else{
+    upper_triangle <- simmatrix
+  }
+  
+  # Convert the matrix to a long format
+  long_format <- melt(
+    upper_triangle, 
+    na.rm = TRUE, varnames = c("ID1", "ID2"), value.name = var.name)
+  
+  long_format
+}
+
+
+station.pairs <- cor_matrix %>% 
+  melt_similarity(., "correlation") %>% 
+  left_join(
+    dist_matrix %>%
+      melt_similarity(., "dist_km", FALSE),
+    by = c("ID1","ID2")
+  )
+  
+
+# check no NAs
+# station.pairs %>% 
+  # filter(if_all(everything(), ~is.na(.)))
+
+
+
+```
+
+```{r}
+# plot of correlation vs distance
+# 
+station.pairs %>%
+  ggplot() +
+  geom_point(aes(dist_km,correlation), col= "darkblue", alpha=0.3)
+   
+station.pairs %>%
+  ggplot() +
+  geom_point(aes(dist_km,abs(correlation)), col= "darkblue", alpha=0.3)
+
+station.pairs %>%
+  ggplot() +
+  geom_density2d(aes(dist_km,abs(correlation)))
+
+station.pairs %>% 
+  mutate(
+    dist.group= cut(
+      dist_km/1000,
+      breaks = seq(0,1.5,by=0.2),
+      right = FALSE)) %>% 
+  ggplot()+
+  geom_violin(aes(dist.group, abs(correlation), fill= dist.group))+
+  theme(legend.position = "none")+
+  xlab("Distance in thousands of km")+ylab("absolute value of correlation")+
+  scale_fill_brewer("Blues",direction = -1)
+ggsave(file.path(annual.rev.path,"abscorrelation_decay.png"))
+station.pairs %>% 
+  mutate(
+    dist.group= cut(
+      dist_km/1000,
+      breaks = seq(0,1.5,by=0.2),
+      right = FALSE)) %>% 
+  ggplot()+
+  geom_violin(aes(dist.group, (correlation), fill= dist.group))+
+  theme(legend.position = "none")+
+  xlab("Distance in thousands of km")+ylab("Correlation")+
+  scale_fill_brewer("Blues",direction = -1)
+ggsave(file.path(annual.rev.path,"correlation_decay.png"))
+```
+## Normality assumption (PENDING test)
+```{r}
+
+# bias density vs normal density
+bias.q <- quantile(midas_clean2$bias, probs = c(0.025,0.975))
+# Filter the data to keep only the inner 95%
+filtered_data <- midas_clean2 #%>% 
+  # filter(between(bias, bias.q[1], bias.q[2]))
+
+# Calculate mean and standard deviation of the filtered data
+bias_mean <- mean(filtered_data$bias)
+bias_sd <- sd(filtered_data$bias)
+filtered_data %>% 
+  ggplot()+
+  stat_density(aes(bias, col="bias density"), geom="line")+
+  stat_function(aes(color = "normal distribution"),
+    fun = dnorm, 
+    args = list(mean = bias_mean, sd = bias_sd), 
+    # color = "normal", 
+    linetype = "dashed"
+  )+labs(color="")+
+  scale_color_lancet()+
+  theme(
+    legend.position = "inside", legend.position.inside = c(.1,.7),
+    legend.background = element_rect(fill = NA, color = NA),
+    legend.key = element_rect(fill = NA, color = NA)
+  )
+
+set.seed(0)
+filtered_data %>%
+  sample_n(1e5) %>%
+  ggplot( aes(sample = bias)) +
+  stat_qq(col="darkblue")+
+  stat_qq_line(col="red")+
+  labs(
+    title = sprintf("QQ Plot of ERA5 Bias - %04d",yearsel),
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal()+scale_color_lancet()
+ggsave(file.path(annual.rev.path,"bias_qqplot.png"))
+# range(filtered_data$bias)
+# bias qq-norm plots
+# set.seed(0)
+# mydf = 10	
+# # Create a QQ plot using ggplot2
+# filtered_data %>% 
+#   sample_n(1e5) %>% 
+#   ggplot( aes(sample = bias)) +
+#   stat_qq(distribution = qt, dparams = list(df=mydf)) + 
+#   stat_qq_line(distribution = qt, dparams = list(df=mydf)) +
+#   labs(
+#     title = "QQ Plot of Bias Data",
+#     x = "Theoretical Quantiles",
+#     y = "Sample Quantiles"
+#   ) +
+#   theme_minimal()
+```
+```{r}
+# bias by select stations
+sel.stations <- c(19260)
+# bias density vs normal density
+bias.q <- midas_clean2 %>% 
+  filter(SRC_ID %in% sel.stations) %>% 
+  pull(bias) %>% 
+  quantile(., probs = c(0.025,0.975))
+# Filter the data to keep only the inner 95%
+filtered_data <- midas_clean2 %>%
+  filter(SRC_ID %in% sel.stations)
+  # filter(between(bias, bias.q[1], bias.q[2]))
+
+# Calculate mean and standard deviation of the filtered data
+bias_mean <- mean(filtered_data$bias)
+bias_sd <- sd(filtered_data$bias)
+filtered_data %>% 
+  ggplot()+
+  stat_density(aes(bias, col="bias density"), geom="line")+
+  stat_function(aes(color = "normal distribution"),
+    fun = dnorm, 
+    args = list(mean = bias_mean, sd = bias_sd), 
+    # color = "normal", 
+    linetype = "dashed"
+  )+labs(color="")+
+  scale_color_lancet()+
+  theme(
+    legend.position = "inside", legend.position.inside = c(.1,.7),
+    legend.background = element_rect(fill = NA, color = NA),
+    legend.key = element_rect(fill = NA, color = NA)
+  )
+
+# set.seed(0)
+filtered_data %>%
+  # sample_n(1e5) %>%
+  ggplot( aes(sample = bias)) +
+  stat_qq(col="darkblue")+
+  stat_qq_line(col="red")+
+  labs(
+    title = sprintf("QQ Plot of ERA5 Bias - %04d",yearsel),
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal()+scale_color_lancet()
+```
+```{r}
+# bias by select stations
+n.stat <- 11
+set.seed(0)
+sel.stations <-c(19260, sample(midas_clean2$SRC_ID, n.stat))
+# bias density vs normal density
+bias.q <- midas_clean2 %>% 
+  filter(SRC_ID %in% sel.stations) %>% 
+  pull(bias) %>% 
+  quantile(., probs = c(0.025,0.975))
+# Filter the data to keep only the inner 95%
+filtered_data <- midas_clean2 %>%
+  filter(SRC_ID %in% sel.stations)
+  # filter(between(bias, bias.q[1], bias.q[2]))
+
+
+# Calculate mean and standard deviation for each SRC_ID
+stats <- filtered_data %>%
+  group_by(SRC_ID) %>%
+  summarize(mean_bias = mean(bias), sd_bias = sd(bias), .groups = 'drop')
+
+# Merge these statistics with the original data
+filtered_data <- filtered_data %>%
+  left_join(stats, by = "SRC_ID")
+
+
+
+# set.seed(0)
+filtered_data %>%
+  # sample_n(1e5) %>%
+  ggplot( aes(sample = bias)) +
+  stat_qq(col="darkblue", size = 0.5)+
+  stat_qq_line(col="red")+
+  labs(
+    title = sprintf("QQ Plot of ERA5 Bias - %04d",yearsel),
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  facet_wrap(~Name)+
+  theme_minimal()+scale_color_lancet()
+ggsave(file.path(annual.rev.path,"bias_qqplot_selectstations.png"))
+```
+
+```{r}
+# # Filter the data to keep only the inner 95%
+# filtered_data <- midas_clean2 %>%
+#   filter(SRC_ID %in% sel.stations)
+# # Calculate mean and standard deviation for each SRC_ID
+# stats <- filtered_data %>%
+#   group_by(SRC_ID) %>%
+#   summarize(mean_bias = mean(bias), sd_bias = sd(bias), .groups = 'drop')
+# 
+# # Merge these statistics with the original data
+# filtered_data <- filtered_data %>%
+#   left_join(stats, by = "SRC_ID")
+# 
+# # Generate a sequence of x values for plotting normal distribution
+# x_seq <- seq(min(filtered_data$bias), max(filtered_data$bias), length.out = 1000)
+# 
+# # Create data frame for the normal distribution lines
+# normal_dist_lines <- stats %>%
+#   rowwise() %>%
+#   mutate(
+#     y = list(dnorm(x_seq, mean = mean_bias, sd = sd_bias))
+#   ) %>%
+#   unnest(cols = c(y)) %>%
+#   mutate(x = rep(x_seq, times = n.stat))  # Repeat x values for each SRC_ID
+# 
+# # Plot density and normal distribution
+# ggplot(filtered_data) +
+#   stat_density(aes(x = bias, color = "bias density"), geom = "line") +
+#   geom_line(
+#     data = normal_dist_lines, 
+#     aes(x = x, y = y, color = "normal distribution"),
+#     linetype = "dashed"
+#   ) +
+#   facet_wrap(~SRC_ID) +
+#   labs(color = "") +
+#   scale_color_manual(values = c("bias density" = "blue", "normal distribution" = "red")) +
+#   theme(
+#     legend.position = "bottom", 
+#     # legend.position.inside = c(0.95, .95),
+#     legend.background = element_rect(fill = NA, color = NA),
+#     legend.key = element_rect(fill = NA, color = NA)
+#   )
+
+```
+
+
+```{r}
+# # Load necessary library
+# library(fitdistrplus)
+# 
+# # Define degrees of freedom to test
+# dfs <- c(1, 2, 5, 10)
+# # Fit t-distribution for different degrees of freedom and perform goodness-of-fit tests
+# fit_results <- lapply(dfs, function(df) {
+#   fit <- fitdist(filtered_data$bias, "t", start = list(df = df))
+#   gof <- gofstat(fit)
+#   list(fit = fit, gof = gof)
+# })
+# 
+# # Print goodness-of-fit statistics
+# fit_results
+```
+
+## Stations clustering (PENDING)
+
+
+## Lasso Regression
+
+## Spatial Random effects
+
+```{r}
+
+# filter observations
+t.sample <- as.POSIXct(
+  sprintf("%04d-05-23 11:00:00",yearsel),
+  tz = "UTC")
+
+# midas subset
+df.sample <- midas_clean %>% 
+  filter(OB_TIME %in% t.sample) %>% 
+  filter(SRC_ID %in% ids.0) %>% 
+  left_join(
+    stations.meta %>% 
+      dplyr::select(src_id,elevation),
+    by = c("SRC_ID"="src_id")
+  )
+# subset stations table
+station.table.inscope2 <- stations.meta %>% 
+  filter(src_id %in% df.sample$SRC_ID)
+
+```
+
+### Locations
+
+```{r mesh0, fig.width=4.5, fig.height=5}
+# Locations <- station.table.inscope2 %>% dplyr::select(Longitude,Latitude) # creates error in make.A
+Locations <- cbind(station.table.inscope2$Longitude,
+                   station.table.inscope2$Latitude)
+stepsize <- 4 * 1 / 70 # each degree is approximately 70km near london. So we're creating a grid of 4km
+x.range <- diff(range(Locations[, 1]))
+y.range <- diff(range(Locations[, 2]))
+nxy <- round(c(x.range, y.range) / stepsize)
+
+
+```
+
+### Convex mesh
+
+```{r}
+# Generate the INLA mesh
+loc.mesh <-  fmesher::fm_mesh_2d_inla(
+  Locations,
+  max.edge = c(1.5, 5), #c(1.5,5) 
+  cutoff = 0.1, #0.1
+  min.angle = 28,
+  # max.n.strict = c(400,60),
+  # plot.delay = TRUE,
+  offset = c(-.05,-.05)
+)
+plot(loc.mesh)
+title("INLA Mesh for Bias Model")
+
+
+```
+
+### Non-convex mesh
+
+```{r}
+# bound2 <- inla.nonconvex.hull(
+#   Locations, 
+#   convex = -0.1, concave = -0.1,
+#   resolution = 80)
+# 
+# loc.mesh.nc <- inla.mesh.2d(
+#   Locations,
+#   # loc.domain = Locations,
+#   boundary = bound2,
+#   max.edge = c(1.5, 5),
+#   cutoff = 0.2,
+#   min.angle = 21,
+#   # plot.delay = TRUE,
+#   offset = c(-.1,-.1)
+#   )
+# plot(loc.mesh.nc)
+# title("INLA Mesh for Bias Model")
+```
+
+### Mesh on map
+
+```{r}
+# Convert mesh to a data frame for plotting
+mesh_df <- data.frame(
+  x = loc.mesh$loc[,1],
+  y = loc.mesh$loc[,2]
+)
+
+# Extract mesh vertices and edges
+vertices <- loc.mesh$loc
+triangles <- loc.mesh$graph$tv
+# Create a data frame for the edges
+edges_df <- data.frame(
+  x = c(vertices[triangles[,1], 1], vertices[triangles[,2], 1], NA, 
+        vertices[triangles[,2], 1], vertices[triangles[,3], 1], NA, 
+        vertices[triangles[,3], 1], vertices[triangles[,1], 1], NA),
+  y = c(vertices[triangles[,1], 2], vertices[triangles[,2], 2], NA,
+        vertices[triangles[,2], 2], vertices[triangles[,3], 2], NA,
+        vertices[triangles[,3], 2], vertices[triangles[,1], 2], NA)
+)
+
+close.range <- stations.meta[,c("Latitude","Longitude")] %>% 
+  sapply(.,range) 
+
+# Apply floor to the first row and ceiling to the second row
+close.range <- apply(close.range, 1, function(row) {
+  ifelse(row == close.range[1,], floor(row), ceiling(row))
+})
+# Load world map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+# Generate the base map
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1]-3, close.range[2,2]+3) +
+  ylim(close.range[1,1]-2, close.range[1,2]+2) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = stations.meta %>% 
+               # Joining with avg bias
+               left_join(
+                 process_data(midas_clean, year),
+                 by = c("src_id"="SRC_ID"),
+                 suffix = c("", ".2")
+               ), 
+             aes(x = Longitude, y = Latitude, size = bias), 
+             shape = 21, 
+             color = "white",
+             fill = "#4B0082")
+
+# Plot the INLA mesh on top of the map
+final_plot <- map +
+  # geom_path(data = edges_df, aes(x = x, y = y), color = "lightgray",size=0.3,alpha=0.1) +
+  geom_point(data = mesh_df, aes(x = x, y = y), color = "blue", size=0.4, alpha=0.8) +
+  ggtitle("INLA Mesh Overlay on Map")+
+  theme(
+    legend.position = "inside",legend.position.inside = c(0.1,0.8),
+    legend.background = element_rect(fill = NA, color = NA),
+  legend.key = element_rect(fill = NA, color = NA)
+  )
+
+# Display the final plot
+# print(final_plot)
+```
+
+```{r}
+# Plot the INLA mesh on top of the map
+final_plot <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1]-3, close.range[2,2]+3) +
+  ylim(close.range[1,1]-2, close.range[1,2]+2) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, linewidth=0.5, fill =  NA) +
+  # plot mesh
+    gg(loc.mesh,
+      edge.color = "darkgray",
+      int.color = "darkblue",
+      ext.color = "darkblue"
+    )+
+  # Add stations as points
+  geom_point(data = stations.meta %>% 
+               filter(src_id %in% ids.0) %>% 
+               # Joining with avg bias
+               left_join(
+                 process_data(midas_clean, year),
+                 by = c("src_id"="SRC_ID"),
+                 suffix = c("", ".2")
+               ), 
+             aes(x = Longitude, y = Latitude, size = bias), 
+             shape = 21, 
+             color = "white",
+             fill = "#4B0082")+
+  # geom_path(data = edges_df, aes(x = x, y = y), color = "lightgray",size=0.3,alpha=0.1) +
+  # geom_point(data = mesh_df, aes(x = x, y = y), color = "blue", size=0.4, alpha=0.8) +
+  ggtitle("INLA Mesh Overlay on Bias Map")+ xlab("Longitude")+ylab("Latitude")+
+  theme(
+    legend.position = "inside",legend.position.inside = c(0.1,0.8),
+    legend.background = element_rect(fill = NA, color = NA),
+  legend.key = element_rect(fill = NA, color = NA)
+  )
+
+
+
+# Display the final plot
+print(final_plot)
+
+```
+
+
+```{r meshbiasmap, fig.width=4.5, fig.height=7}
+
+b.cuts <- c(-3, -0.5,0.5, 3, Inf)
+b.labels <- c("-3 to -0.5", "-0.5 to 0.5", "0.5 to 3", "more")
+b.cuts <- c(-3,-0.5,0.5, 2)
+# b.labels <- c("-3 to -2","-2 to -1", "-1 to 0","0 to 1", "1 to 2")
+
+
+create_labels <- function(cuts) {
+  n <- length(cuts)
+  labels <- vector("character", n - 1)
+  
+  for (i in 1:(n - 1)) {
+    labels[i] <- paste(cuts[i], "to", cuts[i + 1])
+  }
+  
+  return(labels)
+}
+
+b.labels <- create_labels(b.cuts)
+b.values = 1+1:length(b.labels); names(b.values) <- b.labels
+```
+
+#### Bias map with mesh
+
+```{r meshbiasmap, fig.width=4.5, fig.height=7}
+bias.data <- stations.meta %>% 
+  filter(src_id %in% ids.0) %>% 
+               # joining with avg bias
+               left_join(
+                 process_data(midas_clean,year),
+                 by = c("src_id"="SRC_ID"),
+                 suffix = c("", ".2")
+               ) %>% 
+  mutate(
+    bias_category = cut(
+      bias,
+      breaks = b.cuts,
+      labels = b.labels,
+      right = FALSE
+    )
+  )
+# Plot the INLA mesh on top of the map
+final_plot <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1]-3, close.range[2,2]+3) +
+  ylim(close.range[1,1]-2, close.range[1,2]+2) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, linewidth=0.5, fill =  NA) +
+  # plot mesh
+    gg(loc.mesh,
+      edge.color = "darkgray",
+      int.color = "darkblue",
+      ext.color = "darkblue"
+    )+
+  geom_point(data = bias.data, 
+             aes(x = Longitude, y = Latitude, size = bias_category), 
+             shape = 21, 
+             color = "white",
+             fill = "#4B0082") +
+  scale_size_manual(
+    name = "Bias",
+    values = b.values,
+    drop = FALSE
+  )+
+  ggtitle("INLA Mesh Overlay on Bias Map")+ xlab("")+ylab("")+
+  theme_minimal()+
+  theme(
+    legend.position = "inside",legend.position.inside = c(0.15,0.8),
+    legend.background = element_rect(fill = NA, color = NA),
+  legend.key = element_rect(fill = NA, color = NA)
+  )
+
+
+
+# Display the final plot
+print(final_plot)
+
+```
+
+
+
+
+```{r}
+hist(bias.data$bias,breaks=20)
+
+bias.data$bias %>% range()
+```
+### model
+
+#### preparation
+
+```{r}
+# Creating A matrix (Observation/prediction matrix)
+loc.A <- inla.spde.make.A(loc.mesh, loc = Locations)
+#Creating Matern SPDE model object with PC prior
+loc.spde = inla.spde2.pcmatern(mesh = loc.mesh,
+prior.range = c(1, 0.5),
+prior.sigma = c(1, 0.5))
+#Generating the SPDE model index vector
+loc.w <- inla.spde.make.index('w', n.spde = loc.spde$n.spde)
+
+# projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]), 
+#   ylim = range(Locations[, 2]), dims = nxy)
+
+projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]), 
+  ylim = range(Locations[, 2]))
+
+#First we make the model matrix using the model formula,
+#but without response and intercept.
+X0 <- model.matrix( ~ 0 + WIND_SPEED + elevation, data = df.sample)
+
+X <- as.data.frame(X0) # convert to a data frame.
+# Making the stack
+N <- nrow(df.sample) #Saving the number of rows in the data
+
+Stackcalib <- inla.stack(
+# specify the response variable
+data = list(y = df.sample$bias),
+# Vector of Multiplication factors for fixed effects
+A = list(1, 1, loc.A),
+#Specify the fixed and random effects
+effects = list(
+# specify the manual intercept!
+Intercept = rep(1, N),
+# attach the model matrix
+X = X,
+# attach the w
+w = loc.w) )
+```
+
+```{r}
+
+```
+
+#### model fit
+
+```{r}
+m.I2 <- inla(y ~ 0 + Intercept + WIND_SPEED + elevation +
+  f(w, model = loc.spde),
+family = "Gaussian",
+data = inla.stack.data(Stackcalib),
+control.compute = list(cpo=T,dic = T),
+control.predictor = list(A = inla.stack.A(Stackcalib)))
+
+# m.I2$summary.random$w
+xmean <- inla.mesh.project(projgrid,
+  m.I2$summary.random$w$mean)
+xsd <- inla.mesh.project(projgrid, m.I2$summary.random$w$sd)
+```
+
+```{r}
+summary(m.I2)
+
+```
+
+```{r}
+m.I2.nlscpo=-sum(log(m.I2$cpo$cpo)) # Negative Log Sum CPO
+cat("NLSCPO of INLA model 2:",m.I2.nlscpo,"\n")
+cat("DIC of INLA model 2:",m.I2$dic$dic,"\n") # Deviance Information Criteria
+cat("Standard deviation of mean residuals for INLA model 2:",
+    sd(df.sample$bias-m.I2$summary.fitted.values$mean[1:N]),"\n") # RMSE
+```
+
+```{r}
+# Generate the INLA mesh
+loc.mesh <-  fmesher::fm_mesh_2d_inla(
+  Locations,
+  max.edge = c(0.8, 5), #c(1.5,5) 
+  cutoff = 0.1, #0.1
+  min.angle = 28,
+  max.n.strict = c(400,60),
+  # plot.delay = TRUE,
+  offset = c(-.05,-.05)
+)
+plot(loc.mesh)
+title("INLA Mesh for Bias Model")
+
+# my_mesh(
+#   Locations,
+#   n.points = 4000,
+#   max.edge = c(0.1, 5),
+#   cutoff = 0.08,
+#   min.angle = 28)
+
+# undebug(my_mesh)
+```
+
+```{r}
+inla.calib <- main.model(
+  points = Locations,
+  n.points = 5100, # 510
+  data = df.sample,
+  max.edge = c(0.8, 5), 
+  cutoff = 0.1,
+  min.angle = 28)
+summary.info(inla.calib$model)
+inla.calib$mesh$n
+ggField(inla.calib$model, inla.calib$mesh, Groups = 1,Res=600) + scale_fill_brewer(palette = "RdBu")
+
+# debug(main.model)
+# undebug(main.model)
+```
+
+```{r}
+inla.calib <- main.model(
+  points = Locations,
+  n.points = 400, # 510
+  data = df.sample,
+  max.edge = c(0.8, 5), 
+  cutoff = 0.1,
+  min.angle = 28,
+  prior.range = c(1, 0.1), # P(range < a) = b. 1/5th domain
+  prior.sigma = c(2, 0.1) # P(sigma > a) = b sample variance
+  )
+
+summary.info(inla.calib$model)
+# inla.calib$mesh$n
+ggField(inla.calib$model, inla.calib$mesh, Groups = 1,Res=600) + scale_fill_brewer(palette = "RdBu")
+```
+
+```{r}
+inla.calib <- main.model(
+  points = Locations,
+  n.points = 400, # 510
+  data = df.sample,
+  max.edge = c(0.8, 5), 
+  cutoff = 0.1,
+  min.angle = 28,
+  prior.range = c(0.1, 0.1), # P(range < a) = b
+  prior.sigma = c(2, 0.1), # P(sigma > a) = b
+  alpha = 2
+  )
+
+summary.info(inla.calib$model)
+inla.calib$mesh$n
+ggField(inla.calib$model, inla.calib$mesh, Groups = 1,Res=400) + scale_fill_brewer(palette = "RdBu")+
+  coord_fixed(ratio = 1.5)
+
+
+```
+
+```{r}
+inla.calib$model$summary.linear.predictor$mean %>% hist(breaks=20)
+```
+
+```{r}
+n.features <- length(inla.calib$mode$marginals.fixed)
+par(mfrow=c(2,2))
+for (i in 1:n.features){
+  plot(inla.calib$mode$marginals.fixed[[i]], main=names(inla.calib$mode$marginals.fixed)[i], type ="l")
+}
+
+```
+
+```{r}
+n.features <- length(inla.calib$mode$marginals.hyper)
+par(mfrow=c(2,2))
+for (i in 1:n.features){
+  plot(inla.calib$mode$marginals.hyper[[i]], main=names(inla.calib$mode$marginals.hyper)[i], type ="l")
+}
+```
+## average daily bias
+
+<!-- ### data -->
+
+<!-- ```{r} -->
+
+<!-- # filter observations -->
+<!-- start_t <- as.POSIXct(sprintf("%04d-05-15 00:00:00",yearsel),tz="UTC") -->
+<!-- end_t <- as.POSIXct(sprintf("%04d-05-23 00:00:00",yearsel),tz = "UTC") -->
+<!-- # t.sample <- as.POSIXct( -->
+<!-- #   c("2023-05-23 11:00:00", "2023-05-23 12:00:00","2023-05-23 13:00:00"), -->
+<!-- #   tz = "UTC") -->
+<!-- # Create the sequence -->
+<!-- t.sample<- seq(from = start_t, to = end_t, by = "hour") -->
+
+<!-- n.times <- length(t.sample) -->
+<!-- h.count <- seq(1,n.times) -->
+<!-- # midas subset -->
+<!-- df.sample <- midas_clean %>%  -->
+<!--   filter(OB_TIME %in% t.sample) %>%  -->
+<!--   filter(SRC_ID %in% ids.0) %>%  -->
+<!--   left_join( -->
+<!--     stations.meta %>%  -->
+<!--       dplyr::select(src_id,elevation), -->
+<!--     by = c("SRC_ID"="src_id") -->
+<!--   ) %>%  -->
+<!--   mutate(secs = difftime(OB_TIME, start_t, units = "secs"), -->
+<!--          h = as.numeric(secs)/3600+1) -->
+
+<!-- # subset stations table -->
+<!-- station.table.inscope2 <- stations.meta %>%  -->
+<!--   filter(src_id %in% df.sample$SRC_ID) -->
+
+<!-- Locations.sample <- as.matrix(df.sample[, c("Longitude","Latitude")])  -->
+<!-- ``` -->
+
+<!-- ### mesh -->
+
+<!-- ```{r} -->
+
+<!-- # Generate the INLA mesh -->
+<!-- loc.mesh <-  fmesher::fm_mesh_2d_inla( -->
+<!--   Locations, -->
+<!--   max.edge = c(1.5, 5), #c(1.5,5)  -->
+<!--   cutoff = 0.1, #0.1 -->
+<!--   min.angle = 28, -->
+<!--   max.n.strict = c(400,50), -->
+<!--   # plot.delay = TRUE, -->
+<!--   offset = c(-.05,-.1) -->
+<!-- ) -->
+<!-- plot(loc.mesh) -->
+<!-- title("INLA Mesh for Bias Model") -->
+
+<!-- ``` -->
+
+<!-- ### model prep -->
+
+<!-- ```{r} -->
+<!-- # undebug(inla.spde.make.A) -->
+<!-- #Creating Matern SPDE model object with PC prior -->
+<!-- loc.spde = inla.spde2.pcmatern(mesh = loc.mesh, -->
+<!--   prior.range = c(0.1, 0.1), # P(range < a) = b -->
+<!--   prior.sigma = c(2, 0.1) # P(sigma > a) = b -->
+<!-- ) -->
+<!-- #Generating the SPDE model index vector -->
+<!-- loc.w <- inla.spde.make.index('w', n.spde = loc.spde$n.spde, n.group = n.times) -->
+<!-- # Creating A matrix (Observation/prediction matrix) -->
+<!-- loc.A <- inla.spde.make.A( -->
+<!--   loc.mesh, loc = Locations.sample,  -->
+<!--   group = df.sample$h) # change to hours after a time -->
+<!-- # projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]),  -->
+<!-- #   ylim = range(Locations[, 2]), dims = nxy) -->
+<!-- #  -->
+<!-- projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]), -->
+<!--   ylim = range(Locations[, 2])) -->
+
+<!-- #First we make the model matrix using the model formula, -->
+<!-- #but without response and intercept. -->
+<!-- X0 <- model.matrix( ~ 0 + WIND_SPEED + elevation, data = df.sample) -->
+
+<!-- X <- as.data.frame(X0) # convert to a data frame. -->
+<!-- # Making the stack -->
+<!-- N <- nrow(df.sample) #Saving the number of rows in the data -->
+
+<!-- Stackcalib <- inla.stack( -->
+<!-- # specify the response variable -->
+<!-- data = list(y = df.sample$bias), -->
+<!-- # Vector of Multiplication factors for fixed effects -->
+<!-- A = list(1, 1, loc.A), -->
+<!-- #Specify the fixed and random effects -->
+<!-- effects = list( -->
+<!--   # specify the manual intercept! -->
+<!--   Intercept = rep(1, N), -->
+<!--   # attach the model matrix -->
+<!--   X = X, -->
+<!--   # attach the w -->
+<!--   w = loc.w) -->
+<!--   ) -->
+<!-- ``` -->
+
+<!-- ### model run -->
+
+<!-- ```{r} -->
+<!-- bias.mst <- inla(y ~ 0 + Intercept + WIND_SPEED + elevation + -->
+<!--   f(w, model = loc.spde), -->
+<!-- family = "Gaussian", -->
+<!-- data = inla.stack.data(Stackcalib), -->
+<!-- control.compute = list(cpo=T,dic = T), -->
+<!-- control.predictor = list(A = inla.stack.A(Stackcalib))) -->
+
+
+<!-- xmean <- inla.mesh.project(projgrid, -->
+<!--   bias.mst$summary.random$w$mean) -->
+<!-- xsd <- inla.mesh.project(projgrid, bias.mst$summary.random$w$sd) -->
+<!-- ``` -->
+
+<!-- ### results -->
+
+<!-- ```{r} -->
+<!-- summary.info(bias.mst) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- ggField(bias.mst, loc.mesh, Groups = 1,Res=600) + scale_fill_brewer(palette = "RdBu")+ -->
+<!--   coord_fixed(ratio = 1.5) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- n.features <- length(bias.mst$marginals.fixed) -->
+<!-- par(mfrow=c(2,2)) -->
+<!-- for (i in 1:n.features){ -->
+<!--   plot(bias.mst$marginals.fixed[[i]], main=names(bias.mst$marginals.fixed)[i], type ="l") -->
+<!-- } -->
+
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- n.features <- length(bias.mst$marginals.hyper) -->
+<!-- par(mfrow=c(2,2)) -->
+<!-- for (i in 1:n.features){ -->
+<!--   plot(bias.mst$marginals.hyper[[i]], main=names(bias.mst$marginals.hyper)[i], type ="l") -->
+<!-- } -->
+<!-- ``` -->
+
+## Multiple times
+
+### data
+
+```{r}
+
+# filter observations
+start_t <- as.POSIXct(sprintf("%04d-05-15 00:00:00",yearsel),tz="UTC")
+end_t <- as.POSIXct(sprintf("%04d-05-23 00:00:00",yearsel),tz = "UTC")
+# t.sample <- as.POSIXct(
+#   c("2023-05-23 11:00:00", "2023-05-23 12:00:00","2023-05-23 13:00:00"),
+#   tz = "UTC")
+# Create the sequence
+t.sample<- seq(from = start_t, to = end_t, by = "hour")
+
+n.times <- length(t.sample)
+h.count <- seq(1,n.times)
+# midas subset
+df.sample <- midas_clean2 %>% 
+  filter(OB_TIME %in% t.sample) %>% 
+  # filter(SRC_ID %in% ids.0) %>% 
+  left_join(
+    stations.meta %>% 
+      dplyr::select(src_id,elevation),
+    by = c("SRC_ID"="src_id")
+  ) %>% 
+  mutate(secs = difftime(OB_TIME, start_t, units = "secs"),
+         h = as.numeric(secs)/3600+1) %>% 
+  mutate(hour=hour(OB_TIME))
+
+# subset stations table
+station.table.inscope2 <- stations.meta %>% 
+  filter(src_id %in% df.sample$SRC_ID)
+
+Locations.sample <- as.matrix(df.sample[, c("Longitude","Latitude")]) 
+```
+
+### mesh
+
+```{r}
+
+# Generate the INLA mesh
+loc.mesh <-  fmesher::fm_mesh_2d_inla(
+  Locations,
+  max.edge = c(1.5, 5), #c(1.5,5) 
+  cutoff = 0.1, #0.1
+  min.angle = 28,
+  max.n.strict = c(400,50),
+  # plot.delay = TRUE,
+  offset = c(-.05,-.1)
+)
+plot(loc.mesh)
+title("INLA Mesh for Bias Model")
+
+```
+
+### model prep
+
+```{r}
+bias.sd <- with(df.sample, sd(bias))
+# undebug(inla.spde.make.A)
+#Creating Matern SPDE model object with PC prior
+loc.spde = inla.spde2.pcmatern(mesh = loc.mesh,
+  prior.range = c(2, 0.5), # P(range < a) = b. 1/5th domain
+  prior.sigma = c(bias.sd, 0.5) # P(sigma > a) = b sample variance
+)
+
+#Generating the SPDE model index vector
+loc.w <- inla.spde.make.index('w', n.spde = loc.spde$n.spde, n.group = n.times)
+# Creating A matrix (Observation/prediction matrix)
+loc.A <- inla.spde.make.A(
+  loc.mesh, loc = Locations.sample, 
+  group = df.sample$h) # change to hours after a time
+# projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]), 
+#   ylim = range(Locations[, 2]), dims = nxy)
+# 
+projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]),
+  ylim = range(Locations[, 2]))
+
+#First we make the model matrix using the model formula,
+#but without response and intercept.
+X0 <- model.matrix( ~ 0 + eraws10 #+ elevation
+                    +hour
+                    ,
+                    data = df.sample)
+
+X <- as.data.frame(X0) # convert to a data frame.
+# Making the stack
+N <- nrow(df.sample) #Saving the number of rows in the data
+
+Stackcalib <- inla.stack(
+# specify the response variable
+data = list(y = df.sample$bias),
+# Vector of Multiplication factors for fixed effects
+A = list(1, 1, loc.A),
+#Specify the fixed and random effects
+effects = list(
+  # specify the manual intercept!
+  Intercept = rep(1, N),
+  # attach the model matrix
+  X = X,
+  # attach the w
+  w = loc.w),
+tag = "stdata"
+  )
+```
+
+### model run
+
+```{r}
+bias.mst0 <- inla(y ~ 0 + Intercept + #eraws10 +#+WIND_SPEED + #elevation +
+  # f(hour, model = "iid")+
+  f(w, model = loc.spde),
+family = "Gaussian",
+data = inla.stack.data(Stackcalib),
+control.compute = list(cpo=T,dic = T),
+control.predictor = list(A = inla.stack.A(Stackcalib)))
+
+
+# xmean <- inla.mesh.project(projgrid,
+#   bias.mst$summary.random$w$mean)
+# xsd <- inla.mesh.project(projgrid, bias.mst$summary.random$w$sd)
+summary.info(bias.mst0)
+```
+
+```{r}
+bias.mst <- inla(y ~ 0 + Intercept + #eraws10 +#+WIND_SPEED + #elevation +
+  f(hour, model = "iid")+
+  f(w, model = loc.spde),
+family = "Gaussian",
+data = inla.stack.data(Stackcalib),
+control.compute = list(cpo=T,dic = T),
+control.predictor = list(
+  compute = TRUE,
+  A = inla.stack.A(Stackcalib)))
+
+
+xmean <- inla.mesh.project(projgrid,
+  bias.mst$summary.random$w$mean)
+xsd <- inla.mesh.project(projgrid, bias.mst$summary.random$w$sd)
+```
+
+### results
+
+```{r}
+summary.info(bias.mst)
+```
+
+```{r}
+
+# Create a continuous "RdBu" color palette
+# rd_bu_palette <- colorRampPalette(c("darkred","violet", "lightblue","violet", "darkred"))
+# rd_bu_palette <- colorRampPalette(c("darkred","orange", "lightblue","violet", "darkred"))
+# Create a continuous "RdBu" color palette
+rd_bu_palette <- colorRampPalette(
+  c("red", "white", "blue"),
+  bias = 1,
+  interpolate = "spline")
+
+ggField(bias.mst, loc.mesh, Groups = 1,Res=600)+
+scale_fill_brewer(palette = "RdBu")
+ggField(bias.mst, loc.mesh, Groups = 1,Res=600,
+        Fill = "cont") +
+  scale_fill_gradientn(colors = rd_bu_palette(50))
+
+ggField(bias.mst, loc.mesh, Groups = 1,Res=600,
+        Fill = "cont")
+  # scale_fill_gradientn(colors = rd_bu_palette(100))
+  # scale_fill_brewer(palette = "RdBu")+
+  # coord_fixed(ratio = 1.5)
+```
+
+```{r}
+n.features <- length(bias.mst$marginals.fixed)
+par(mfrow=c(1,2))
+for (i in 1:n.features){
+  plot(bias.mst$marginals.fixed[[i]], main=names(bias.mst$marginals.fixed)[i], type ="l")
+}
+
+```
+
+```{r}
+n.features <- length(bias.mst$marginals.hyper)
+par(mfrow=c(2,2))
+for (i in 1:n.features){
+  plot(bias.mst$marginals.hyper[[i]], main=names(bias.mst$marginals.hyper)[i], type ="l")
+}
+```
+
+```{r}
+data.frame(
+  hour = 0:23,
+  effect = bias.mst$summary.random$hour$mean,
+  low = bias.mst$summary.random$hour$`0.025quant`,
+  high = bias.mst$summary.random$hour$`0.975quant`) %>% 
+  ggplot(aes(hour,effect))+
+  geom_ribbon(aes(ymin=low,ymax=high),fill="lightblue",alpha=0.5)+
+  geom_line(aes(y=effect))
+```
+
+
+## LM
+
+```{r}
+ws.lm.stat <- lm(WIND_SPEED ~ eraws10, 
+                 data = midas_clean2 %>% 
+                   mutate(Name = factor(Name)))
+summary(ws.lm.stat)
+```
+
+## Quantile Matching
+
+```{r}
+manual.bw <- 0.5
+mypal2 <- ggsci::pal_lancet()(2)
+# era 5 vs midas density
+midas_clean %>% 
+  filter(SRC_ID %in% ids.0) %>% 
+  pivot_longer(cols = c(WIND_SPEED,eraws10)) %>% 
+  mutate(name = factor(name, levels = c("WIND_SPEED", "eraws10"))) %>% # Reorder factor levels
+  ggplot()+
+  stat_density(
+    aes(x=value, col=name),
+    geom="line",position="identity",
+    bw = manual.bw) +
+  scale_color_manual(
+    values = c("eraws10" = mypal2[1], "WIND_SPEED" = mypal2[2]),
+    labels = c("WIND_SPEED" = "MIDAS", "eraws10" = "ERA5"))+
+  theme(
+    legend.position = "inside", legend.position.inside = c(.7,.6),
+    legend.background = element_rect(fill = NA, color = NA),
+    legend.key = element_rect(fill = NA, color = NA))+
+  labs(col="source")+
+  coord_cartesian(xlim = c(0,50))
+
+```
+
+```{r}
+qqmod <- fitQmap(
+  obs = midas_clean %>% filter(SRC_ID %in% ids.0) %>% pull(WIND_SPEED),
+  mod = midas_clean %>% filter(SRC_ID %in% ids.0) %>% pull(eraws10),
+  method = "QUANT")
+mypal2 <- ggsci::pal_lancet()(3)
+midas_clean %>% 
+  filter(SRC_ID %in% ids.0) %>% 
+  mutate(era5_qm = doQmapQUANT(eraws10, qqmod, type="linear")) %>% 
+  pivot_longer(cols = c(WIND_SPEED,eraws10,era5_qm)) %>% 
+  mutate(name = factor(name, levels = c("WIND_SPEED", "eraws10", "era5_qm"))) %>% # Reorder factor levels
+  ggplot()+
+  stat_density(
+    aes(x=value, col=name),
+    geom="line",position="identity",
+    bw = manual.bw) +
+  labs(col="source")+
+  scale_color_manual(values = c("eraws10" = mypal2[1], "WIND_SPEED" = mypal2[2], "era5_qm" = mypal2[3]),
+                     labels = c("WIND_SPEED" = "MIDAS", "eraws10" = "ERA5", "era5_qm" = "ERA5 BC"))+
+  theme(
+    legend.position = "inside", legend.position.inside = c(.7,.6),
+    legend.background = element_rect(fill = NA, color = NA),
+    legend.key = element_rect(fill = NA, color = NA))+
+  labs(col="source")+
+  coord_cartesian(xlim = c(0,50))
+
+
+```
+
+```{r}
+# midas_clean2$WIND_SPEED %>% range()
+# view(midas_clean2 %>% filter(WIND_SPEED>25))
+qqmod$par %>% as.data.frame() %>% 
+  ggplot(aes(fitq,modq)) +
+  geom_point(col = "darkblue",pch=1)+
+  geom_abline(slope=1,col="darkred",lty=2)+
+  xlab("MIDAS quantiles")+ylab("ERA5 quantiles")+labs()+
+  coord_cartesian(xlim = c(0,15),ylim = c(0,15))
+# plot(qqmod$par$fitq,qqmod$par$modq,xlim=c(0,20))
+# abline(0,1,col="red")
+
+
+# not well calibrated
+# two groups
+# compare with inla
+
+```
+
+```{r}
+midas_clean %>%
+  filter(SRC_ID %in% ids.0) %>% 
+  mutate(era5_qm = doQmapQUANT(eraws10, qqmod, type = "linear")) %>%
+  pivot_longer(cols = c(WIND_SPEED, eraws10, era5_qm)) %>%
+  mutate(name = factor(name, levels = c("WIND_SPEED", "eraws10", "era5_qm"))) %>% # Reorder factor levels
+  ggplot() +
+  stat_ecdf(aes(x = value, col = name), geom = "line", position = "identity") +
+  labs(col = "source") +
+  scale_color_manual(
+    values = c("eraws10" = mypal2[1], "WIND_SPEED" = mypal2[2], "era5_qm" = mypal2[3]),
+    labels = c("WIND_SPEED" = "MIDAS", "eraws10" = "ERA5", "era5_qm" = "ERA5 BC")
+  ) +
+    theme(
+    legend.position = "inside", legend.position.inside = c(.7,.6),
+    legend.background = element_rect(fill = NA, color = NA),
+    legend.key = element_rect(fill = NA, color = NA))+
+  coord_cartesian(xlim = c(0, 50))
+
+# QUANTILE
+```
+
+```{r}
+# midas_clean %>%
+#   filter(SRC_ID %in% ids.0) %>% 
+#   mutate(era5_qm = doQmapQUANT(eraws10, qqmod, type = "linear")) %>%
+#   pivot_longer(cols = c(WIND_SPEED, eraws10, era5_qm)) %>%
+#   mutate(name = factor(name, levels = c("WIND_SPEED", "eraws10", "era5_qm"))) %>% # Reorder factor levels
+#   ggplot() +
+#   stat_ecdf(aes(x = value, col = name), geom = "line", position = "identity") +
+#   labs(col = "source") +
+#   scale_color_manual(
+#     values = c("eraws10" = mypal2[1], "WIND_SPEED" = mypal2[2], "era5_qm" = mypal2[3]),
+#     labels = c("WIND_SPEED" = "MIDAS", "eraws10" = "ERA5", "era5_qm" = "ERA5 BC")
+#   ) +
+#     theme(
+#     legend.position = "inside", legend.position.inside = c(.7,.6),
+#     legend.background = element_rect(fill = NA, color = NA),
+#     legend.key = element_rect(fill = NA, color = NA))+
+#   coord_cartesian(xlim = c(0, 50))
+```
+
+### Transfer Function
+
+```{r}
+range.era <- range(midas_clean2$eraws10)
+era.ws <- seq(range.era[1],range.era[2],length.out = 25)
+
+mm2.bc.slope = with(midas_clean2, sd(WIND_SPEED)/sd(eraws10))
+mm2.bc.intercept =  with(midas_clean2, mean(WIND_SPEED)-mm2.bc.slope*mean(eraws10))
+
+trans.f <- data.frame(
+  era5 = era.ws) %>% 
+  mutate(
+  era5.bc = doQmapQUANT(era5, qqmod, type = "linear"),
+  qm= era5.bc - era5
+  ) %>% 
+  mutate(lm.bc = predict(ws.lm.stat,newdata = data.frame(eraws10=era.ws))) %>% 
+  mutate(var.bc = mm2.bc.intercept+era5*mm2.bc.slope)
+
+delta.bc <- with(
+  midas_clean2,
+  mean(WIND_SPEED-eraws10)
+)
+view(trans.f)
+# midas_clean2 %>% 
+#   mutate(
+#     delta.bc = calibration_mm(eraws10, WIND_SPEED,"mean"),
+#     var.bc = calibration_mm(eraws10, WIND_SPEED,"both"),
+#     bc.1 = delta.bc - eraws10, bc.2 = var.bc - eraws10
+#   ) %>% slice(sample(1:1e6,size=200)) %>% 
+#   ggplot(aes(eraws10,bc.2))+geom_line()
+
+
+trans.f %>% 
+  ggplot(aes(era5,era5.bc))+
+  geom_point()+
+  geom_abline(slope = 1, col="darkred",lty=2)+
+  coord_cartesian(xlim = c(0,15),ylim = c(0,15))
+
+trans.f %>% 
+  ggplot(aes(era5,qm))+
+  # geom_point()+
+  geom_hline(aes(yintercept = delta.bc,col="Delta method"))+
+  # geom_abline(aes(intercept = mm2.bc.intercept, slope=mm2.bc.slope-1,col="Variance"))+
+  geom_line(aes(y=var.bc-era5,col="Variance BC"))+
+  geom_line(aes(col="Quantile Mapping"))+
+  # geom_line(aes(y=lm.bc-era5,col="LM"))+
+  geom_hline(yintercept = 0, col="darkred",lty=2)+
+  xlab("ERA5 Wind Speed")+ylab("Bias Correction")+labs(col="method")+
+  theme(legend.position = "inside", legend.position.inside = c(0.3,.8),
+        legend.background = element_rect(fill = NA, color = NA),
+    legend.key = element_rect(fill = NA, color = NA))+
+  coord_cartesian(xlim = c(0,15),ylim = c(-2,2))+
+  scale_color_lancet()
+
+```
+
+```{r}
+
+```
+
+## Moment matching
+
+```{r}
+calibration_mm <- function(
+    mod, 
+    obs,
+    moment = c("mean","variance","both"),
+    type = c("additive","multiplicative")){
+  
+  moment = match.arg(moment)
+  type = match.arg(type)
+  if(type == "additive"){
+    if( moment == "mean"){
+      calibrated = mod + mean(obs-mod)
+    } else if (moment == "variance"){
+      calibrated = mod * sd(obs) / sd (mod)
+    } else if (moment == "both"){
+      calibrated = (mod - mean(mod)) * sd(obs) / sd (mod) + mean(obs)
+    }
+  } else{
+    if( moment == "mean"){
+      calibrated = mod * mean(obs) / mean(mod)
+    } else if (moment == "variance"){
+      calibrated = mod * sd(obs) / sd (mod)
+    } else if ( moment == "both"){
+      calibrated = mod * mean(obs) / mean(mod)
+      warning("Multiplicative bias correction cannot correct both moments at the same time.\n moment='mean' was used instead")
+    }
+  }
+  return(calibrated)
+}
+
+```
+
+```{r}
+# mypal2 <- ggsci::pal_lancet()(6)
+# calib.df <- midas_clean %>%
+#   filter(SRC_ID %in% ids.0) %>% 
+#   mutate(era5_qm = doQmapQUANT(eraws10, qqmod, type = "linear")) %>%
+#   mutate(era5_mm1 = calibration_mm(eraws10, WIND_SPEED,"mean"),
+#          era5_mm2 = calibration_mm(eraws10, WIND_SPEED,"both"),
+#          era5_mm3 = calibration_mm(eraws10, WIND_SPEED,type = "multiplicative")) 
+# 
+# calib.df %>% 
+#   pivot_longer(cols = c(WIND_SPEED, eraws10,matches("era5"))) %>%
+#   mutate(name = factor(name, 
+#                        levels = c("WIND_SPEED", "eraws10", "era5_qm",paste0("era5_mm",1:3)))) %>% # Reorder factor levels
+#   ggplot() +
+#   stat_ecdf(aes(x = value, col = name), geom = "line", position = "identity") +
+#   labs(col = "source") + xlab("Wind speed m/s")+
+#   scale_color_manual(
+#     values = c("eraws10" = mypal2[1], "WIND_SPEED" = mypal2[2], "era5_qm" = mypal2[3],
+#                "era5_mm1" = mypal2[4], "era5_mm2" = mypal2[5], "era5_mm3" = mypal2[6]),
+#     labels = c("WIND_SPEED" = "MIDAS", "eraws10" = "ERA5", "era5_qm" = "Quantile BC",
+#                "era5_mm1" ="Additive BC","era5_mm2" ="Mean-Var BC","era5_mm3" ="Multiplicative BC")
+#   ) +
+#     theme(
+#     legend.position = "inside", legend.position.inside = c(.7,.6),
+#     legend.background = element_rect(fill = NA, color = NA),
+#     legend.key = element_rect(fill = NA, color = NA))+
+#   coord_cartesian(xlim = c(0, 30))
+```
+
+
+## Comparison vs INLA
+
+```{r}
+df.sample %>% nrow()
+bias.mst$summary.linear.predictor %>% nrow()
+bias.mst$summary.fitted.values %>% head()
+
+Stackcalib$data$index %>% range()
+idat <- inla.stack.index(Stackcalib,"stdata")$data
+
+df.comparison <- df.sample %>% 
+  # QM
+  mutate(
+    era5.bc = doQmapQUANT(eraws10,qqmod),
+    qm.bc = era5.bc-eraws10,
+    qm.res = qm.bc - bias) %>% 
+  mutate(
+    inla.bc = bias.mst$summary.linear.predictor$mean[idat],
+    inla.bc.low = bias.mst$summary.linear.predictor$`0.025quant`[idat],
+    inla.bc.high = bias.mst$summary.linear.predictor$`0.975quant`[idat],
+    inla.res = inla.bc - bias
+  )
+
+```
+
+```{r}
+df.comparison %>%
+  pivot_longer(cols = c(qm.res,inla.res), names_to = "method",values_to = "error") %>% 
+  ggplot(aes(x=method,y=error, fill=method))+
+  geom_boxplot(outliers = FALSE)+
+  scale_fill_simpsons()
+```
+
+## Rescaling (PENDING)
+```{r}
+# midas_clean.orig <- midas_clean
+# Standardize all numeric columns
+# midas_clean <- midas_clean %>%
+#   mutate(across(where(is.numeric), ~ scale(.) %>% as.vector()))
+# midas_clean <- midas_clean.orig
+  
+```
+## Coordinate change (Pending)
+
+
+```{r}
+time.sel <- as.POSIXct(
+  "2022-08-26 01:00:00", 
+  tz = "UTC", 
+  format = "%Y-%m-%d %H:%M:%S") 
+# Convert to an sf object, specifying the coordinate columns
+sf_midas <- midas_clean2 %>% 
+  filter(OB_TIME %in% time.sel) %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326)
+
+# myepsg <- 4326
+myepsg <- 32629 # Transforming to UTM Zone 29N (EPSG:32629)
+# myepsg <- 27700 # EPSG:27700 for British National Grid
+# myepsg <- 3857 # Web Mercatosr (EPSG:3857)
+# myepsg <- 3395 # Mercator (EPSG:3395)
+# myepsg <- 29903# Irish Grid (EPSG:29903)
+# myepsg <- 2157# Irish Transverse Mercator (EPSG:2157)
+sf_midas <- sf_midas %>% 
+  st_transform(., myepsg) 
+
+# require(PBSmapping) 
+# data fusion
+```
+
+```{r}
+# midas_clean2 %>% 
+#   pull(bias) %>% 
+#   range()
+factor.km <- 1000
+# factor.km <- 1
+coord.range <- sf_midas %>% st_coordinates() %>% 
+  apply(., 2, range)
+coord.min <- sf_midas %>% st_coordinates() %>% 
+  apply(., 2, \(x) min(x)/factor.km) %>% 
+  sapply(\(x) trunc(x*.98/10,0)*10)
+sf_midas %>% 
+  mutate(bias.cat = trunc(bias,0) %>% factor) %>% 
+  ggplot(aes( col = bias.cat))+
+  geom_sf(size=3)+
+  coord_sf(datum = st_crs(myepsg)) +
+  scale_x_continuous(labels = function(x) paste0(x / factor.km, " km")) +
+  scale_y_continuous(labels = function(y) paste0(y / factor.km, " km")) +
+  labs(x = "Easting (km)", y = "Northing (km)")+
+  theme(axis.text.x = element_text(angle = 45))+
+  scale_color_brewer(palette = "RdBu")
+```
+
+
+## Simplified model
+
+### only spatial effect
+```{r}
+# filter observations
+t.sample <- as.POSIXct(
+  sprintf("%04d-05-23 11:00:00",yearsel),
+  tz = "UTC")
+
+# midas subset
+df.sample <- midas_clean2 %>% 
+  filter(OB_TIME %in% t.sample) %>% 
+  filter(SRC_ID %in% ids.0) %>% 
+  left_join(
+    stations.meta %>% 
+      dplyr::select(src_id,elevation),
+    by = c("SRC_ID"="src_id")
+  ) %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>% 
+  st_transform(., myepsg) 
+
+# subset stations table
+station.table.inscope2 <- stations.meta %>% 
+  filter(src_id %in% df.sample$SRC_ID) 
+
+stations.inscope.sdf <- station.table.inscope2 %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>% 
+  st_transform(., myepsg)
+
+
+coords_in_km <- function(sf_data){
+  
+  # Extract the coordinates
+  coords_meters <- st_coordinates(sf_data)
+  
+  # Convert meters to kilometers
+  coords_kilometers <- coords_meters / 1000
+  
+  # Recreate the geometry with the converted coordinates
+  # Note: st_sfc needs a list of geometries, so we apply st_point to each row
+  geom_km <- st_sfc(
+    lapply(1:nrow(coords_kilometers), 
+           function(i) st_point(coords_kilometers[i, ])), 
+    crs = st_crs(sf_data))
+
+  
+  # Update the geometry in the sf object
+  sf_data_utm_km <- sf_data
+  st_geometry(sf_data_utm_km) <- geom_km
+  
+  sf_data_utm_km
+}
+
+station.table.inscope2 <- station.table.inscope2 %>% 
+  bind_cols(
+    stations.inscope.sdf %>%  
+      coords_in_km() %>%
+    st_coordinates() %>% 
+    as.data.frame() %>% 
+    setNames(c("easting_m","northing_m")))
+```
+
+```{r}
+Locations <- cbind(station.table.inscope2$easting_m,
+                   station.table.inscope2$northing_m)
+stations.sp <- stations.inscope.sdf %>% 
+    coords_in_km() %>%
+    as_Spatial()
+# plot(Locations)
+
+# GenLocations# Generate the INLA mesh
+loc.mesh <-  fmesher::fm_mesh_2d_inla(
+  stations.inscope.sdf %>% 
+    coords_in_km() %>%
+    as_Spatial(),
+  max.edge = c(150, 500), #c(1.5,5) 
+  cutoff = 10, #0.1
+  min.angle = 28,
+  # max.n.strict = c(400,60),
+  # plot.delay = TRUE,
+  offset = c(-.1,-.1)
+)
+plot(loc.mesh)
+bound.in <- fm_nonconvex_hull_inla(
+  Locations,
+  convex = -0.1,
+  concave = -0.1,
+  )
+# plot(bound.in)
+bound.out <- fm_nonconvex_hull_inla(
+  Locations,
+  convex = -0.25,
+  concave = -0.05,
+  )
+
+# plot(bound.out)
+bounds.2 <- list(bound.in, bound.out)
+loc.mesh <- fm_mesh_2d_inla(
+  loc = Locations,
+  boundary = bounds.2,
+  max.edge = c(200, 500), #c(1.5,5)
+  cutoff = 10, #0.1
+  min.angle = 28,
+  # max.n.strict = c(400,60),
+  # plot.delay = TRUE,
+  offset = c(-.1,-.1),
+)
+# loc.mesh$loc[,1] %>% range()
+plot(loc.mesh, axes = TRUE, xlim = c(0,1500))
+# points(Locations,pch = 19)
+title("INLA Mesh for Bias Model")
+# class(loc.mesh)
+
+# plot.inla.mesh()
+# plot.fm_mesh_2d()
+```
+
+```{r}
+# meshbuilder()
+```
+
+
+```{r}
+# Locations <- cbind(station.table.inscope2$easting_m,
+#                    station.table.inscope2$northing_m)
+# # Generate the INLA mesh
+# loc.mesh <-  fmesher::fm_mesh_2d_inla(
+#   stations.inscope.sdf %>% 
+#     coords_in_km() %>% 
+#     as_Spatial(),
+#   max.edge = c(100, 300), #c(1.5,5) 
+#   cutoff = 10, #0.1
+#   min.angle = 28,
+#   # max.n.strict = c(400,60),
+#   # plot.delay = TRUE,
+#   offset = c(-.1,-.1)
+# )
+# plot(loc.mesh)
+# title("INLA Mesh for Bias Model")
+
+```
+
+```{r}
+# Creating A matrix (Observation/prediction matrix)
+loc.A <- inla.spde.make.A(loc.mesh, loc = Locations)
+#Creating Matern SPDE model object with PC prior
+# loc.spde = inla.spde2.pcmatern(mesh = loc.mesh,
+# prior.range = c(1, 0.5),
+# prior.sigma = c(1, 0.5))
+
+bias.sd <- with(df.sample, sd(bias))
+# undebug(inla.spde.make.A)
+#Creating Matern SPDE model object with PC prior
+
+loc.spde = inla.spde2.pcmatern(mesh = loc.mesh,
+  prior.range = c(240, 0.5), # P(range < a) = b. 1/5th domain
+  prior.sigma = c(bias.sd, 0.5) # P(sigma > a) = b sample variance
+)
+#Generating the SPDE model index vector
+loc.w <- inla.spde.make.index('w', n.spde = loc.spde$n.spde)
+
+# projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]), 
+#   ylim = range(Locations[, 2]), dims = nxy)
+
+
+
+#First we make the model matrix using the model formula,
+#but without response and intercept.
+X0 <- model.matrix( ~ 0 , data = df.sample)
+
+X <- as.data.frame(X0) # convert to a data frame.
+# Making the stack
+N <- nrow(df.sample) #Saving the number of rows in the data
+
+Stackcalib <- inla.stack(
+# specify the response variable
+data = list(y = df.sample$bias),
+# Vector of Multiplication factors for fixed effects
+A = list(1, loc.A),
+#Specify the fixed and random effects
+effects = list(
+# specify the manual intercept!
+Intercept = rep(1, N),
+# attach the model matrix
+# X = X,
+# attach the w
+w = loc.w) )
+```
+
+```{r}
+bias.mst0 <- inla(y ~ 0 + Intercept + #eraws10 +#+WIND_SPEED + #elevation +
+  # f(hour, model = "iid")+
+  f(w, model = loc.spde),
+family = "Gaussian",
+data = inla.stack.data(Stackcalib),
+control.compute = list(cpo=T,dic = T),
+control.predictor = list(A = inla.stack.A(Stackcalib)))
+
+
+# xmean <- inla.mesh.project(projgrid,
+#   bias.mst$summary.random$w$mean)
+# xsd <- inla.mesh.project(projgrid, bias.mst$summary.random$w$sd)
+summary.info(bias.mst0)
+```
+
+
+#### Projection plot
+```{r}
+specs <- field_plot(bias.mst0$summary.random$w$mean,
+           mesh = loc.mesh,
+  obs.points = Locations,
+  stepsize = 4,
+  # plot.obs = TRUE,
+  # col=NA,
+  main="Mean"
+  )
+pgrid0 <- specs$grid
+nxy <- specs$nxy
+```
+
+```{r}
+# fitted values
+
+pred.stack <- inla.stack(
+  data = list(y = NA),
+  A = list(1, pgrid0$proj$A),
+  effects = list(Intercept = rep(1, prod(nxy)), w = 1:loc.spde$n.spde),
+  tag = 'pred.grid')
+
+stk.all <- inla.stack(Stackcalib, pred.stack)
+
+bias.pred <- inla(y ~ 0 + Intercept + #eraws10 +#+WIND_SPEED + #elevation +
+  # f(hour, model = "iid")+
+  f(w, model = loc.spde),
+  family = "Gaussian",
+  data = inla.stack.data(stk.all),
+  # control.compute = list(cpo=T,dic = T),
+  control.predictor = list(
+    A = inla.stack.A(stk.all),
+    compute = TRUE),
+  control.mode=list(theta=bias.mst0$mode$theta, restart = FALSE),
+  # control.results = list(return.marginals.random = FALSE, 
+  #   return.marginals.predictor = FALSE)
+)
+
+igr <- inla.stack.index(stk.all, 'pred.grid')$data
+fit.m <- matrix(bias.pred$summary.fitted.values$mean[igr], nxy[1], nxy[2])
+fit.sd <- matrix(bias.pred$summary.fitted.values$sd[igr], nxy[1], nxy[2])
+```
+
+#### RF mean and SD
+```{r}
+# pdf(file.path(annual.rev.path,"randomfield_m0.pdf"))
+par(mfrow = c(2,2),mar = c(2, 4, 4, 10) + 0.1)
+# plot(NULL, xlim = pgrid0$x %>% range(),ylim = pgrid0$y %>% range())
+field_plot(bias.mst0$summary.random$w$mean,
+           mesh = loc.mesh,
+  obs.points = Locations,
+  stepsize = 4,
+  # axes = TRUE,
+  # xlim = pgrid0$x %>% range(),ylim = pgrid0$y %>% range(),
+  # plot.obs = TRUE,
+  # col=NA,
+  main="Mean Random Field",
+  add = TRUE,
+  # smallplot= c(.95,.99,.1,.9)
+  )
+# undebug(book.plot.field)
+# image()
+# undebug(image.plot)
+# control.compute()
+book.plot.field(list(
+  x = pgrid0$x, y = pgrid0$y, 
+  z = fit.m), main= "Mean Fitted Values",
+  col = colorRampPalette(brewer.pal(11, "RdBu"))(200),
+  xlim = pgrid0$x %>% range(),ylim = pgrid0$y %>% range(),
+  # smallplot= c(.3,.32,.3,.7)
+  )
+plot(get_country_polygon(), add=TRUE, col=NA, 
+                      )
+
+field_plot(bias.mst0$summary.random$w$sd,
+           mesh = loc.mesh,
+  obs.points = Locations,
+  stepsize = 4,
+  # plot.obs = TRUE,
+  color_palette1 = book.color.c2(),
+  # col.country = "white",
+  border.country = "lightgray",
+  point.col = "lightgray",
+  main="SD Random Field",
+  # smallplot= c(.3,.32,.3,.7)
+  )
+
+book.plot.field(list(
+  x = pgrid0$x, y = pgrid0$y, 
+  z = fit.sd), 
+  col = book.color.c2(),
+  main= "SD Fitted Values",
+  # smallplot= c(.3,.32,.3,.7)
+  )
+
+
+plot(get_country_polygon(), add=TRUE, col=NA, 
+                       border = "lightgray"  )
+# dev.off()
+```
+#### parameter densities
+```{r}
+par(mfrow=c(2,2))
+n.features <- length(bias.mst0$marginals.fixed)
+
+for (i in 1:n.features){
+  plot(bias.mst0$marginals.fixed[[i]], main=names(bias.mst0$marginals.fixed)[i], type ="l")
+}
+n.features <- length(bias.mst0$marginals.hyper)
+
+
+for (i in 1:n.features){
+  plot(bias.mst0$marginals.hyper[[i]], main=names(bias.mst0$marginals.hyper)[i], type ="l")
+}
+```
+#### diagnostics
+```{r}
+
+plot(bias.mst0, single = T)
+
+```
+
+### inlabru
+```{r}
+bias.bru <- bru(bias ~ site(main = coordinates, model = loc.spde), 
+                 family = "Gaussian", data = as_Spatial(df.sample))
+
+summary(bias.bru)
+# bru_convergence_plot(bias.bru)
+```
+#### prediction
+```{r}
+pred_mesh <- predict(bias.bru, fm_pixels(loc.mesh,format = "sp"), ~(Intercept + site))
+# class(pred_mesh)
+
+# Convert pred_mesh to an sf object if it's not already
+# pred_mesh_sf <- st_as_sf(as.data.frame(pred_mesh), coords = c("coords.x1", "coords.x2"), crs = myepsg)  # Replace 32633 with your UTM zone EPSG code
+country.border <- get_country_polygon()# %>% st_set_crs(., myepsg)
+# Create the custom color palette
+custom_palette <- colorRampPalette(brewer.pal(11, "RdBu"))(200)
+ggplot() + 
+  gg(pred_mesh) +
+  # scale_fill_viridis_c()
+  # gg(loc.mesh)+
+  gg(country.border,fill=NA, col="black")+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(11, "RdBu"))(200))+
+  geom_sf()+
+  xlab("easting (km)")+ylab("northing (km)")+
+  coord_sf(default_crs = st_crs(myepsg))
+```
+
+### plus elevation
+
+### non linear elev term
+
+### HadUK variables
+
+
+## Posterior checks
+### true vs predictions
+
+### calibration check
+
+
+## Non-stationary model
+
+
+
+## additions
+```{r}
+# GF mean and covariance
+# non convex hull
+# fitted mean
+# validating in new points
+# posterior checks / calibration
+
+
+
+# project in points
+# joint estimation / prediction
+# hpd marginal vs observed values
+
+# non linear effects vs linear
+# model selection through CPO
+
+```
+
+```{r}
+# loc.mesh$loc %>% head()
+# Locations %>% head()
+
+
+
+```
+
+
+```{r}
+# projection on a fine grid
+stepsize <- 2
+x.range <- diff(range(Locations[, 1]))
+y.range <- diff(range(Locations[, 2]))
+nxy <- round(c(x.range, y.range) / stepsize)
+
+pgrid0 <- inla.mesh.projector(
+  loc.mesh, 
+  xlim = range(Locations[, 1])*c(0.8,1.2), 
+  ylim = range(Locations[, 2])*c(0.975,1.025),
+  dims = nxy)
+
+# extract projections
+prd0.m <- inla.mesh.project(
+  pgrid0,
+  bias.mst0$summary.random$w$mean)                          
+prd0.s <- inla.mesh.project(
+  pgrid0,
+  bias.mst0$summary.random$w$sd)
+# scales::show_col(viridis(200),FALSE)
+# scales::show_col(turbo(100),FALSE)
+color_palette <- colorRampPalette(brewer.pal(11, "RdBu"))(200)
+# scales::show_col(color_palette,FALSE)
+```
+
+
+```{r}
+book.plot.field(
+  list(x = pgrid0$x, y = pgrid0$y, z = prd0.m),
+  col = color_palette,
+  # poly = loc.mesh,
+  # axes = TRUE,
+  )
+# undebug(book.plot.field)
+plot(temp[1] %>% coords_in_km2(), add=TRUE,col=NA) # add UK country border
+points(Locations,pch = 19, cex= 0.5)
+
+
+
+```
+
+### add countries
+```{r}
+
+
+plot(get_country_polygon(), col=NA)
+(ne_countries(
+  scale = "medium", 
+  country = c("ireland","united kingdom"),
+  returnclass = "sf") %>% 
+  st_transform(., myepsg) %>% #as_Spatial() %>% 
+  st_coordinates() )[1,1:2]
+
+temp <- 
+ne_countries(
+  scale = "medium", 
+  country = c("ireland","united kingdom"),
+  returnclass = "sf") %>% 
+  st_transform(., myepsg)
+plot(temp)
+
+
+```
+
+### testing
+
+```{r}
+# bias.mst0 <- inla(y ~ 0 + Intercept + #eraws10 +#+WIND_SPEED + #elevation +
+#   # f(hour, model = "iid")+
+#   f(w, model = loc.spde),
+# family = "Gaussian",
+# data = inla.stack.data(Stackcalib),
+# control.compute = list(cpo=T,dic = T),
+# control.predictor = list(A = inla.stack.A(Stackcalib)))
+
+
+bias.bru <- bru(bias ~ site(main = coordinates, model = loc.spde), 
+                 family = "Gaussian", data = as_Spatial(df.sample))
+
+summary(bias.bru)
+bru_convergence_plot(bias.bru)
+```
+
+
+```{r}
+pred_mesh <- predict(bias.bru, fm_pixels(loc.mesh,format = "sp"), ~(Intercept + site))
+# class(pred_mesh)
+
+# Convert pred_mesh to an sf object if it's not already
+# pred_mesh_sf <- st_as_sf(as.data.frame(pred_mesh), coords = c("coords.x1", "coords.x2"), crs = myepsg)  # Replace 32633 with your UTM zone EPSG code
+country.border <- get_country_polygon()# %>% st_set_crs(., myepsg)
+# Create the custom color palette
+custom_palette <- colorRampPalette(brewer.pal(11, "RdBu"))(200)
+ggplot() + 
+  gg(pred_mesh) +
+  # scale_fill_viridis_c()
+  # gg(loc.mesh)+
+  gg(country.border,fill=NA, col="black")+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(11, "RdBu"))(200))+
+  geom_sf()+
+  xlab("easting (km)")+ylab("northing (km)")+
+  coord_sf(default_crs = st_crs(myepsg))
+
+  #+ #gg(boundary)
+```
+
+
+```{r}
+spde.posterior(bias.bru, "site", what = "matern.covariance") -> covplot
+spde.posterior(bias.bru, "site", what = "matern.correlation") -> corplot
+multiplot(plot(covplot), plot(corplot))
+```
+```{r}
+summary(bias.mst0)
+```
+
+```{r}
+corplot %>% class()
+ggplot()+
+gg(corplot)
+plot(corplot)
+debug(plot)
+plot(covplot)
+bias.bru %>% 
+  spde.posterior("site", what = "range") %>% 
+  plot()
+```
+
+
+```{r}
+
+pred.stack <- inla.stack(
+  data = list(y = NA),
+  A = list(1, pgrid0$proj$A),
+  effects = list(Intercept = rep(1, prod(nxy)), w = 1:loc.spde$n.spde),
+  tag = 'pred.grid')
+
+stk.all <- inla.stack(Stackcalib, pred.stack)
+
+bias.pred <- inla(y ~ 0 + Intercept + #eraws10 +#+WIND_SPEED + #elevation +
+  # f(hour, model = "iid")+
+  f(w, model = loc.spde),
+  family = "Gaussian",
+  data = inla.stack.data(stk.all),
+  # control.compute = list(cpo=T,dic = T),
+  control.predictor = list(
+    A = inla.stack.A(stk.all),
+    compute = TRUE),
+  control.mode=list(theta=bias.mst0$mode$theta, restart = FALSE),
+  # control.results = list(return.marginals.random = FALSE, 
+  #   return.marginals.predictor = FALSE)
+)
+
+igr <- inla.stack.index(stk.all, 'pred.grid')$data
+matrix(bias.pred$summary.fitted.values$mean[igr], nxy[1], nxy[2])
+par(mfrow = c(2, 2), mar = c(0, 0, 0, 0))
+book.plot.field(list(x = pgrid0$x, y = pgrid0$y, z = prd0.m))
+book.plot.field(list(x = pgrid0$x, y = pgrid0$y, z = matrix(bias.pred$summary.fitted.values$mean[igr], nxy[1], nxy[2])))
+book.plot.field(list(x = pgrid0$x, y = pgrid0$y, z = prd0.s),
+  col = book.color.c2())
+book.plot.field(list(x = pgrid0$x, y = pgrid0$y, z = matrix(bias.pred$summary.fitted.values$sd[igr], nxy[1], nxy[2])),
+  col = book.color.c2())
+```
+
+
+```{r}
+# par(mfrow = c(2,1))
+field_plot(bias.mst0$summary.random$w$mean,
+           mesh = loc.mesh,
+  obs.points = Locations,
+  stepsize = 4,plot.obs = TRUE,
+  # col=NA,
+  main="Mean"
+  )
+
+field_plot(bias.mst0$summary.random$w$sd,
+           mesh = loc.mesh,
+  obs.points = Locations,
+  stepsize = 4,plot.obs = TRUE,
+  color_palette1 = book.color.c2(),
+  # col.country = "white",
+  border.country = "lightgray",
+  point.col = "lightgray",
+  main="SD"
+  )
+```

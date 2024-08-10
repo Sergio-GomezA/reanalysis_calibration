@@ -1,0 +1,1935 @@
+---
+title: "eda_midas"
+format: html
+editor: source
+---
+
+```{r globalopt, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE, cache = F)
+
+```
+
+## packages
+
+```{r include=FALSE}
+require(tidyverse)
+require(kableExtra)
+require(parallel)
+require(data.table)
+require(readxl)
+require(rnaturalearth)
+require(rnaturalearthdata)
+require(janitor)
+require(ncdf4)
+# require(pracma)
+require(fields)# bilinear interpolation
+require(geosphere)
+require(ggrepel)
+require(elevatr)
+require(sf)
+require(ggsci)
+require(lubridate)
+require(plotly)
+```
+
+```{r}
+# Set the theme for all plots
+theme_set(theme_bw())
+```
+
+## Functions
+
+```{r}
+mc <- detectCores()-2
+# list.files("~/OneDrive")
+source("~/OneDrive/kablefunction.R")
+source("helper_functions.R")
+```
+
+## Data
+
+### MIDAS hourly
+
+Reading one year of information.
+
+Note: Headers come in a separate file.
+
+```{r}
+# Define the path to the directory containing the file
+data_path <- "~/Documents/MIDAS"
+# list.files(data_path) %>% head()
+
+# headers from another file
+headers.file <- file.path(data_path,"WH_Column_Headers.txt")
+# Read the first row of the CSV file without treating it as header
+midas.headers <- read.csv(headers.file, header = FALSE, nrows = 1) %>%
+  # Unlist the resulting data frame to convert it into a vector
+  unlist() %>%
+  # Convert the vector to character type
+  as.character() %>%
+  # Remove quotation marks, spaces, and tabs from column names using regular expressions
+  gsub('"|\\s+|\t+', '', .)
+
+yearsel <- 2023
+
+# Define the path to the data file
+file.nam.tmp <- file.path(
+  data_path, 
+  sprintf("midas_wxhrly_%04d01-%04d12.txt", yearsel, yearsel))
+
+# Read the data from the data file using fread from data.table package
+midas_2023 <- fread(
+  file.nam.tmp,            # Path to the data file
+  header = FALSE,          # Specifies that there is no header row in the file
+  col.names = midas.headers   # Specifies the column names to use, obtained from midas.headers
+)
+
+```
+
+```{r}
+midas_2023 %>%
+  head()
+
+# number of unique stations
+midas_2023 %>% pull(SRC_ID) %>% unique() %>% length()
+
+# number of monitoring systems
+midas_2023 %>% pull(ID_TYPE) %>% unique() %>% length()
+
+#
+
+midas_2023 %>%
+  filter(!is.na(WIND_SPEED)) %>% # keep info with wind speed data
+  group_by(ID_TYPE) %>% 
+  count(MET_DOMAIN_NAME) %>% 
+  mutate(n= format(n, big.mark = ",")) %>% 
+  kable(caption = "Number of records with WIND SPEED data by MET DOMAIN and ID_TYPE", align = c("l","l","r")) %>% 
+  kable_styling()
+
+```
+
+Table is in long format. It has hourly weather data for a list of 480 stations.
+
+There are 4 different MET Domains recording information (see abbreviated info below). Essentially, each domain might have different frequencies, purposes, or focus on a specific topic.
+
+Here are some common codes with a brief explanation of what they represent.
+
+```{r codedesc, echo=FALSE, results='asis'}
+knitr::kable(
+  data.frame(
+    Code = c("CLBD", "DCNN", "ICAO", "WMO", "AWSHRLY", "DLY3208", "METAR", "SYNOP"),
+    Description = c("Old commercial Climate Data LoggerS (CDLs)",
+                    "Daily Climatological Network Number",
+                    "Aviation stations only",
+                    "World Meteorological Organisation",
+                    "Has reduced number of available parameters compared to full synoptic sites",
+                    "Daily observations from a climate station entered on Form 3208",
+                    "Aviation related",
+                    "Synoptic coded message format")
+  ),
+  caption = "Code meanings",
+  booktabs = TRUE
+) %>% kable_styling()
+```
+
+### Filtering process
+
+I kept Stations with metadata to get their coordinates. Records with wind speed. Removed duplicated, redundant information from other domains. Tried to fill in the gaps of WMO with the other systems. (PENDING)
+
+Filtering process and na count by station.
+
+```{r}
+
+
+# list of MIDAS stations with wind speed data in WMO
+midas_stat_inscope <- midas_2023 %>% 
+  filter(ID_TYPE %in% c("WMO")) %>% # ONLY WMO domain
+  filter(!is.na(WIND_SPEED)) %>% # with wind speed observation 
+  group_by(OB_TIME) %>% 
+  filter(VERSION_NUM == max(VERSION_NUM)) %>% ungroup() %>% # keep highest version available
+  select(OB_TIME, ID_TYPE, SRC_ID, WIND_SPEED_UNIT_ID, WIND_DIRECTION, WIND_SPEED) %>% unique() %>% # remove duplicates
+  group_by(SRC_ID) %>% 
+  summarise(n = n(), na.count = sum(is.na(WIND_SPEED)), .groups = "drop") %>%
+  mutate(na.perc = (24*365-n+na.count) / (24*365)) %>% 
+  arrange(desc(na.perc)) %>% 
+  filter(na.perc<=.2)
+midas_stat_inscope %>% 
+  dplyr::select(-na.count) %>% 
+  arrange(desc(na.perc)) %>% 
+  head(10) %>% 
+  kable(digits = 2) %>% 
+  kable_styling(full_width = F)
+
+```
+
+This part is about getting the station metadata: location, name, area, etc.
+
+```{r}
+# stations catalogue
+station.table <- read.csv(
+  file.path(data_path,"excel_list_station_details.csv")) %>% 
+  bind_rows(read.csv(
+  file.path(data_path,"excel_list_station_details_extra.xls"), sep = "\t") %>% select(-X))
+
+library(geosphere)
+
+# cut-off distance in KM from London to remove far away stations
+cutoff <- 1132689
+# Center of the UK (e.g., London coordinates)
+uk_center <- c(51.5074, -0.1278)  # Latitude and longitude of London
+
+# Calculate distance between each station and the center of the UK
+station_distances <- apply(station.table[, c("Latitude", "Longitude")], 1, function(row) {
+  distm(uk_center, c(row["Latitude"], row["Longitude"]), fun = distVincentyEllipsoid)
+})
+
+# Calculate distances between stations and the center of the UK
+station_distances <- apply(station.table[, c("Latitude", "Longitude")], 1, function(x) distGeo(x, uk_center))
+
+# Add distance information to the station table
+station_table_with_distances <- cbind(station.table, Distance = station_distances)
+station_table_with_distances %>% 
+  kable() %>% kable_styling(full_width = T)
+# cutoff/1000
+```
+
+Now that I have the list of all stations I'll focus on the "close" stations defined by the cutoff variable.
+
+```{r}
+station.table.inscope <- station_table_with_distances %>% 
+  # close stations catalogue
+  filter(Distance<=cutoff) %>% 
+  filter(src_id %in% midas_stat_inscope$SRC_ID)# filter stations in scope from previous block .
+station.table.inscope %>% 
+  kable() %>% 
+  kable_styling(full_width = T)
+```
+
+### Map of stations in scope
+
+```{r inscopemap, fig.width=5, fig.height=7}
+close.range <- station.table.inscope[,c("Latitude","Longitude")] %>% 
+  sapply(.,range) 
+
+# Apply floor to the first row and ceiling to the second row
+close.range <- apply(close.range, 1, function(row) {
+  ifelse(row == close.range[1,], floor(row), ceiling(row))
+})
+# Load world map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+# Create a base map using ggplot
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1], close.range[2,2]) +
+  ylim(close.range[1,1], close.range[1,2]) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = station.table.inscope, 
+             aes(x = Longitude, y = Latitude, text = paste(Name, " - ", Area)), 
+             color = "darkblue", size = 2) #+
+  # Add labels for stations
+  # geom_text(data = station.table, aes(x = Longitude, y = Latitude, label = Name), size = 3, vjust = 1, hjust = 1)
+
+# Print the map
+print(map)
+
+ggplotly(map)
+
+annual.rev.path <- "../../1st_annual_review/Sergio---Annual-Review-Report---2024/fig2_calib/"
+ggsave(filename = file.path(annual.rev.path,"map_stations.png"),
+       map)
+```
+
+### MIDAS data subset
+
+keep only columns of interest of a fully filtered dataset, with units converted to m/s. Stored processed and filtered file as a csv
+
+```{r}
+# columns to save
+# colnames(midas_2023)
+col.selection <- c(
+  "OB_TIME", #time
+  "ID_TYPE", # record type
+  "SRC_ID", #station id
+  "WIND_SPEED_UNIT_ID",
+  "WIND_DIRECTION",
+  "WIND_SPEED")
+
+
+data.subset <- midas_2023 %>% 
+  filter(ID_TYPE %in% c("WMO")) %>% # ONLY WMO domain
+  filter(!is.na(WIND_SPEED)) %>% # with wind speed observation 
+  group_by(OB_TIME) %>% 
+  filter(VERSION_NUM == max(VERSION_NUM)) %>% ungroup() %>% # keep highest version available
+  filter(SRC_ID %in% station.table.inscope$src_id) %>% 
+  select(any_of(col.selection)) %>% unique() %>% 
+  left_join(station.table.inscope %>% 
+              dplyr::select(src_id, Area, Name, Latitude,Longitude),
+            by = c("SRC_ID"="src_id")) %>% 
+  mutate(WIND_SPEED=case_when(
+    WIND_SPEED_UNIT_ID %in% c(3,4) ~ WIND_SPEED*0.51444424416,
+    # WIND_SPEED_UNIT_ID == 3 ~ WIND_SPEED*0.51444424416,
+    TRUE ~ WIND_SPEED,
+  ))
+# data.subset
+# rm(midas_2023)
+
+midas.fname <- file.path(
+  data_path,
+  paste0("midas_",yearsel,"_processed2.csv")
+)
+  
+if(!file.exists(midas.fname)){
+  write.csv(data.subset,
+          file = midas.fname,
+          row.names = F)
+}
+
+```
+
+Units present 1: m/s and 4: knots
+
+Exploring type of units across stations and regionss
+
+```{r}
+data.subset %>% pull(WIND_SPEED_UNIT_ID) %>% unique()
+
+data.subset %>%
+  group_by(Area) %>%
+  count(WIND_SPEED_UNIT_ID) %>%
+  slice_max(n = 1, with_ties = FALSE, order_by = n) %>% 
+  group_by(WIND_SPEED_UNIT_ID) %>% 
+  summarise(areas = n())
+
+data.subset %>%
+  group_by(Name) %>%
+  count(WIND_SPEED_UNIT_ID) %>%
+  slice_max(n = 1, with_ties = FALSE, order_by = n) %>% 
+  group_by(WIND_SPEED_UNIT_ID) %>% 
+  summarise(stations = n())
+```
+
+MIDAS wind speed density estimate There are some discrete measurements, plus some really high measurements.
+
+```{r}
+data.subset %>% 
+  ggplot()+
+  geom_density(aes(WIND_SPEED))+
+  coord_cartesian(xlim = c(0,30))
+ggsave(filename = file.path(annual.rev.path,"midas_dens_1dec.png"))
+
+data.subset %>% 
+  ggplot()+
+  geom_histogram(aes(WIND_SPEED),bins = 50)
+```
+
+```{r}
+rm(midas_2023)
+```
+
+### ERA5
+
+Extracting data from ERA5 nc file
+
+```{r}
+# Reading data
+
+# Define the path to the directory containing the file
+data_path.era <- "~/Documents/ERA5_UK_2012_2024"
+
+# list.files(data_path.era)
+# Define the filename
+file0 <- sprintf("era5_v1_%04d.nc",yearsel) 
+
+# Combine the path and filename
+file_path <- file.path(data_path.era, file0)
+
+# Open the NetCDF file
+nc <- nc_open(file_path)
+
+# Get the list of variable names in the NetCDF file
+variable_names <- names(nc$var)
+longnames <- lapply(nc$var, \(var) var$longname)
+# Extract coordinate information (latitude, longitude, time)
+lat <- ncvar_get(nc, "latitude")
+lon <- ncvar_get(nc, "longitude")
+# expver <- ncvar_get(nc, "expver") # operational data is experimental version 1
+time <- ncvar_get(nc, "time")
+
+# Convert time to POSIXct
+epoch <- as.POSIXct("1900-01-01 00:00:00", tz = "UTC")
+time_numeric <- as.numeric(time)
+time_posixct <- epoch + (time_numeric * 3600)  # Convert hours to seconds
+
+# Print the list of variable names
+# print(variable_names)
+
+# Extract variables
+variable_data <- lapply(
+  variable_names[1:4], 
+  function(var_name) {ncvar_get(nc, var_name)}
+  ) %>% 
+  setNames(., variable_names[1:4])
+
+# Calculate wind speed
+variable_data[['ws100']] <- sqrt(variable_data$u100^2 + variable_data$v100^2)
+variable_data[['ws10']] <- sqrt(variable_data$u10^2 + variable_data$v10^2)
+# Close the NetCDF file
+nc_close(nc)
+```
+
+Updated map with stations plus ERA5 grid points
+
+```{r maperagrid, fig.width=5, fig.height=7}
+grid_points <- expand.grid(lon=lon, lat=lat)
+
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1], close.range[2,2]) +
+  ylim(close.range[1,1], close.range[1,2]) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = station.table.inscope, aes(x = Longitude, y = Latitude), color = "darkblue", size = 1) +
+  # Add labels for stations
+  # geom_text(data = station.table, aes(x = Longitude, y = Latitude, label = Name), size = 3, vjust = 1, hjust = 1)
+  # Add grid points
+  geom_point(data = grid_points, aes(x = lon, y = lat), color = "red", size = 0.1)+
+  theme_minimal()
+
+
+print(map)
+ggsave(filename = file.path(annual.rev.path,"map_stations_eragrid.png"),
+       map)
+```
+
+#### Interpolation to MIDAS stations
+
+Interpolating ERA5 grid to desire location
+
+```{r}
+# station.table.inscope
+
+
+desired.loc <- station.table.inscope %>%
+  dplyr::select(src_id,Area,Name,Longitude,Latitude) #%>% 
+  # filter(between(Longitude, -9,2),
+  #        between(Latitude, 49,62))
+
+
+# bilinear interpolation
+interp_series <- apply(variable_data[["ws10"]], MARGIN = 3, 
+                       FUN = \(wind.array) {
+                         control_dat <- list(x=lon, y=lat, z=wind.array)
+                         interp_var <- interp.surface(
+                           control_dat,
+                           desired.loc %>% dplyr::select(Longitude,Latitude))
+                       },
+                       simplify = T)
+
+# Convert time variable from nc file to POSIXct
+epoch <- as.POSIXct("1900-01-01 00:00:00", tz = "UTC")
+time_numeric <- as.numeric(time)
+time_posixct <- epoch + (time_numeric * 3600)
+
+
+era.interp <- cbind(desired.loc,interp_series) %>%
+  pivot_longer(!c(src_id:Latitude),values_to = "eraws10") %>% 
+  mutate(name=as.numeric(name)) %>% 
+  left_join(
+    data.frame(name=1:length(time),time=time_posixct),
+    by = "name"
+  ) %>% mutate(time=as.character(time))
+
+
+era.fname <- file.path(
+  data_path,
+  sprintf("era_%04d_interpolated.csv",yearsel))
+if(!file.exists(era.fname)){
+  write.csv(era.interp,era.fname,row.names = F)
+}
+
+rm(interp_series)
+```
+
+Same but as a function
+
+```{r}
+# arguments are:
+# locations data.frame, era5 array and its time,lon,lat dimensions
+# outputs are dataframe in long format with time, location, and time series of wind speed 10m
+
+convert_era5_time <- function(era5.time){
+  # Convert time variable from nc file to POSIXct
+  epoch <- as.POSIXct("1900-01-01 00:00:00", tz = "UTC")
+  
+  #convert to numeric. This represents hours after epoch
+  time_numeric <- as.numeric(era5.time)
+  
+  # updating. This needs to convert time to seconds and then adding to reference point.
+  time_posixct <- epoch + (time_numeric * 3600)
+  
+  return(time_posixct)
+}
+
+inter_grid_to_points <- function(loc.df, spatiotemp.array, lon, lat, time){
+  # bilinear interpolation
+  interp_series <- apply(spatiotemp.array, MARGIN = 3, 
+                         FUN = \(wind.array) {
+                           control_dat <- list(x=lon, y=lat, z=wind.array)
+                           interp_var <- interp.surface(
+                             control_dat,
+                             desired.loc %>% dplyr::select(Longitude,Latitude))
+                         },
+                         simplify = T)
+  
+  # converting time
+  time_posixct <- convert_era5_time(time)
+  
+  # merging everything in a single long data frame
+  era.interp <- cbind(desired.loc,interp_series) %>%
+  pivot_longer(!c(src_id:Latitude),values_to = "eraws10") %>% 
+  mutate(name=as.numeric(name)) %>% 
+  left_join(
+    data.frame(name=1:length(time),time=time_posixct),
+    by = "name"
+  ) %>% mutate(time=as.character(time))
+  
+  return(era.interp)
+}
+
+
+era.interp <- inter_grid_to_points(desired.loc,variable_data[["ws10"]], lon, lat, time)
+
+era.fname <- file.path(
+  data_path,
+  sprintf("era_%04d_interpolated.csv",yearsel))
+if(!file.exists(era.fname)){
+  write.csv(era.interp,era.fname,row.names = F)
+}
+```
+
+```{r}
+# now taking the closest grid point instead of an interpolation
+
+find_nearest_gridpoint <- function(desired.loc, grid_points){
+  # expand grid
+  # grid_points <- expand.grid(lon=lon, lat=lat)
+  
+  # get index of minimum
+  nearest <- mapply(
+  FUN = \(x,y){
+    # Calculate distances between point A and all points in grid_points
+    distance <- with(grid_points,
+      distGeo(
+        matrix(c(lon,lat), ncol=2),
+         matrix(c(x,y), ncol=2)
+        ))
+
+    
+    # Find the index of the point with the minimum distance
+    nearest_index <- which.min(distance)
+    
+    # Extract the nearest point
+    # nearest_point <- grid_points[nearest_index, ]
+    nearest_index 
+  },
+  desired.loc$Longitude,
+  desired.loc$Latitude,
+  SIMPLIFY = T
+)
+  
+}
+
+
+
+
+# nearest_ind <- find_nearest_gridpoint(desired.loc, grid_points)
+inter_grid_to_points <- function(loc.df, spatiotemp.array, lon, lat, time){
+  
+  # find nearest point and extract series
+  temp <- mapply(
+    FUN = \(x,y) {
+      # get nearest lon and lat index
+      lon_index <- which.min(abs(x - lon))
+      lat_index <- which.min(abs(y - lat))
+      # extract values
+      variable_data[["ws10"]][lon_index, lat_index, ]
+    },
+    desired.loc$Longitude,
+    desired.loc$Latitude,
+    SIMPLIFY = F
+  )
+  
+  # Convert time to POSIXct
+  time_posixct <- convert_era5_time(time)
+  
+  # Create a data frame with the extracted value and time
+  era.interp <- data.frame(
+    Longitude = lon,
+    Latitude = lat,
+    eraws10 = nearest_value,
+    time = as.character(time_posixct)
+  )
+  
+  return(era.interp)
+}
+
+get_nearest_era5 <- function(loc_df, spatiotemp.array, lon, lat, time){
+  
+  # extract series of nearest point to each item in loc_df
+  nearest.series <- mapply(
+    FUN = \(x,y) {
+      # get nearest lon and lat index
+      lon_index <- which.min(abs(x - lon))
+      lat_index <- which.min(abs(y - lat))
+      # extract values
+      spatiotemp.array[lon_index, lat_index, ]
+    },
+    desired.loc$Longitude,
+    desired.loc$Latitude,
+    SIMPLIFY = F
+  )
+  
+  # gather result in a single table
+  nearest.series <- nearest.series %>% 
+    do.call(cbind,.) %>%
+    as.data.frame() %>% 
+    setNames(desired.loc$src_id) %>% 
+    mutate(OB_TIME=time) %>% 
+    pivot_longer(cols = -OB_TIME, names_to = "SRC_ID", values_to = "eraws10")
+      
+  nearest.series
+}
+
+# rm(temp)
+era.near <- get_nearest_era5(desired.loc,variable_data[["ws10"]], lon, lat, time_posixct)
+
+era.fname <- file.path(
+  data_path,
+  sprintf("era_%04d_nearest.csv",yearsel)
+)
+  
+if(!file.exists(era.fname)){
+  write.csv(era.near,era.fname,row.names = F)
+}
+# temp <- mapply(
+#   FUN = \(x,y) {
+#     # get nearest lon and lat index
+#     lon_index <- which.min(abs(x - lon))
+#     lat_index <- which.min(abs(y - lat))
+#     # extract values
+#     variable_data[["ws10"]][lon_index, lat_index, ]
+#   },
+#   desired.loc$Longitude,
+#   desired.loc$Latitude,
+#   SIMPLIFY = F
+# )
+# 
+# temp %>% 
+#   do.call(cbind,.) %>% 
+#   as.data.frame() %>% 
+#     setNames(desired.loc$src_id) %>% 
+#     mutate(time=time_posixct) %>% 
+#   pivot_longer(cols = -time, names_to = "src_id", values_to = "era5ws")
+# do that for every point in 
+
+```
+
+#### Joining Datasets
+
+```{r}
+
+myposixct <- function(timevar){
+  as.POSIXct(
+      case_when(
+        nchar(timevar) == 10 ~ paste0(timevar, " 00:00:00"),
+        nchar(timevar) == 16 ~ paste0(timevar, ":00"),
+        TRUE ~ as.character(timevar)),
+      format = "%Y-%m-%d %H:%M:%S", tz="UTC")
+}
+rm(data.subset,era.interp,era.near)
+midas_r <- fread(file.path(data_path,"midas_2023_processed2.csv")) %>% 
+  mutate(OB_TIME=myposixct(OB_TIME))
+# era5_r <- read.csv(file.path(data_path,"era_2023_interpolated.csv")) %>% 
+#   mutate(time=myposixct(time))
+
+era5_r <- read.csv(file.path(data_path,"era_2023_nearest.csv")) %>% 
+  mutate(OB_TIME=myposixct(OB_TIME))
+# era5_r %>% head()  
+midas_clean <-  midas_r %>% 
+  left_join( era5_r, #%>% 
+              # dplyr::select(src_id,time,eraws10),
+            # by = c("SRC_ID"="src_id","OB_TIME"="time")
+            by = c("SRC_ID","OB_TIME")
+            ) %>% 
+  mutate(bias = WIND_SPEED - eraws10)
+
+
+rm(midas_r,era5_r)
+
+calib.fname <- file.path(
+  data_path,
+  sprintf("calib_data_%04d.csv",yearsel))
+
+if(!file.exists(calib.fname)){
+  write.csv(midas_clean,calib.fname, row.names = FALSE)
+}
+
+midas_clean %>% head()
+
+
+```
+
+## Figures
+
+```{r}
+# Define the path to the directory containing the file
+data_path <- "~/Documents/MIDAS"
+yearsel <- 2023
+calib.fname <- file.path(
+  data_path,
+  sprintf("calib_data_%04d.csv",yearsel))
+
+# Read processed data
+midas_clean <- fread(calib.fname)
+```
+
+### Scatterplot ERA5 vs MIDAS
+
+```{r}
+
+set.seed(0)
+midas_clean %>% 
+  slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue",alpha=0.1)+
+  xlab("ERA5")+ylab("MIDAS")+labs(title = "Wind speed comparison, observed vs reanalysis")+
+  theme_bw()+
+  coord_cartesian(ylim = c(0,50))
+
+ggsave(filename = file.path(annual.rev.path,"era5_midas_allstations.png"))
+```
+
+```{r}
+midas_clean %>% 
+  slice(sample(1:nrow(midas_clean),size = 300000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_density_2d()+
+  theme_bw()+
+  coord_cartesian(ylim = c(0,20))
+```
+
+### Subset of points
+
+#### One station
+
+```{r edibias, fig.width=6,fig.height=6}
+
+# one.station.scatter <- function(
+#     data,
+#     station.id = NULL, station.name = NULL,
+#     station.table.inscope = station.table.inscope,
+#     p.col = "darkblue", p.alpha = 0.2, l.col = "red",
+#     ...){
+#   
+#   dat.yr = year(data$OB_TIME[1])
+#   if(!is.null(station.id)){
+#     stat.pos <- which(station.table.inscope$src_id==station.id)
+#     # get name
+#     stat.name <- station.table.inscope$Name[stat.pos]
+#     # get Area
+#     stat.area <- station.table.inscope$Area[stat.pos]
+#     # create subtitle
+#     my.sub <- sprintf("Area: %s, year: %04d",stat.area, dat.yr)
+#     
+#     # One station
+#     fig <- data %>% 
+#       filter(SRC_ID==station.id) %>% 
+#       # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+#       ggplot(aes(eraws10,WIND_SPEED))+
+#       geom_point(col=p.col,alpha=p.alpha)+
+#       geom_abline(slope = 1, intercept = 0, color = l.col) +  # Add 45-degree line
+#       # geom_smooth(method = "gam",formula = y ~s(x, bs ="cs"))+
+#       xlab("ERA5")+ylab("MIDAS")+labs(title = stat.name, subtitle = my.sub)+
+#       coord_fixed(ratio=1)+
+#       theme_bw()
+#   }
+#   print(fig)
+# }
+# view(station.table.inscope)
+one.station.scatter(midas_clean, station.id = 19260, p.col = "darkblue",alpha=0.5)
+
+ggsave(filename = file.path(annual.rev.path,"era5_midas_gogarbank.png"))
+```
+
+#### Time series
+
+```{r one_loc_ts1}
+
+
+mypal2 <- ggsci::pal_lancet()(2)
+
+# one.station.ts <- function(
+#     data,
+#     station.id = NULL, station.name = NULL,
+#     roll.window.hr = 12,
+#     group.var = FALSE,
+#     pal2col = ggsci::pal_lancet()(2),
+#     ...){
+#   
+#   dat.yr = year(data$OB_TIME[1])
+#   if(!is.null(station.id)){
+#     stat.pos <- which(station.table.inscope$src_id==station.id)
+#     # get name
+#     stat.name <- station.table.inscope$Name[stat.pos]
+#     # get Area
+#     stat.area <- station.table.inscope$Area[stat.pos]
+#     # create subtitle
+#     my.sub <- sprintf("Area: %s",stat.area)
+#     
+#     fig <- midas_clean %>% 
+#       filter(SRC_ID==station.id) %>% 
+#       mutate(trimestre = lubridate::quarter(OB_TIME)) %>% 
+#       {if (group.var) group_by(., trimestre) else .} %>%  # Conditionally group_by
+#       mutate(across(c(eraws10,WIND_SPEED),~ zoo::rollmean(., roll.window.hr, fill = c("extend", NA, "extend")))) %>% 
+#       ungroup() %>% 
+#       pivot_longer(cols = c(eraws10,WIND_SPEED)) %>% 
+#       ggplot(aes(OB_TIME,value, col=name))+
+#       geom_line()+
+#       {if (group.var) facet_wrap(
+#         ~trimestre, scales = "free",
+#         labeller=labeller(trimestre = \(x) sprintf("%04dQ%s",dat.yr,x))) } +
+#       xlab("time")+ylab("Wind speed (m/s)")+
+#       labs(title = sprintf("%s. %02d Hours Rolling average",stat.name,roll.window.hr),
+#            subtitle = my.sub,
+#            color= "source")+
+#       theme(legend.position = "bottom")+
+#       scale_color_manual(values = c("eraws10" = mypal2[1], "WIND_SPEED" = mypal2[2]),
+#                          labels = c("eraws10" = "ERA5", "WIND_SPEED" = "MIDAS"))
+#   }
+#   print(fig)
+# }
+one.station.ts(midas_clean, station.id = 19260,roll.window.hr = 72)
+
+ggsave(filename = file.path(annual.rev.path,"era5_midas_gogarbank_ts.png"))
+```
+
+```{r one_loc_ts2, fig.width= 10, fig.height=7}
+# label_parsed()
+one.station.ts(midas_clean, station.id = 19260,roll.window.hr = 1, group.var = TRUE)
+```
+
+#### One point in time
+
+```{r onetimebias, fig.width=4,fig.height=6}
+set.seed(0)
+one.time <- "2023-04-12 14:00:00" %>% 
+  as.POSIXct()
+# One point in time
+midas_clean %>% 
+  # filter(SRC_ID==19260) %>% 
+  filter(OB_TIME==one.time) %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue")+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  geom_text_repel(data = . %>% filter(WIND_SPEED > 20), aes(label = Name), color = "black",size=3)+
+  xlab("ERA5")+ylab("MIDAS")+labs(title = paste0(format(one.time, "%d %b %y at %H:%M")))+
+  coord_fixed(ratio=1)+
+  theme_bw()
+ggsave(filename = file.path(annual.rev.path,"era5_midas_allstations_1t.png"))
+```
+
+```{r}
+library(plotly)
+
+
+one.time <- "2023-04-12 14:00:00" %>% as.POSIXct()
+
+one.time.scatter <- function(
+    data,
+    one.time,
+    plotly.convert = FALSE,
+    p.col = "darkblue", l.col = "red",
+    ...){
+  # Create the ggplot object
+  gg <- data %>% 
+    rename(midas = WIND_SPEED, era5=eraws10) %>% 
+    filter(OB_TIME == one.time) %>% 
+    ggplot(aes(era5, midas,
+               text = paste(Name, " - ", Area))) +
+    geom_point(col = p.col) +
+    geom_abline(slope = 1, intercept = 0, color = l.col) +
+    xlab("ERA5") + ylab("MIDAS") +
+    labs(title = paste0(format(one.time, "%d %b %y at %H:%M"))) +
+    # coord_fixed(ratio = 1) +
+    theme_bw()
+  
+  if(plotly.convert){
+    ggplotly(gg) 
+  }else{
+    print(gg)
+  }
+  
+}
+one.time.scatter(midas_clean,one.time,TRUE)
+```
+
+```{r some_loc_ts, fig.width= 10, fig.height=7}
+# Some stations
+window_size <- 72
+mypal2 <- ggsci::pal_lancet()(2)
+
+some.stations <- midas_clean %>% 
+  filter(OB_TIME==one.time) %>% 
+  filter(WIND_SPEED>20) %>% 
+  pull(SRC_ID) %>% unique()
+
+midas_clean %>% 
+  filter(SRC_ID %in% some.stations) %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  group_by(SRC_ID) %>% 
+  mutate(across(c(eraws10,WIND_SPEED),~ zoo::rollmean(., window_size, fill = c("extend", NA, "extend")))) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = c(eraws10,WIND_SPEED)) %>% 
+  ggplot(aes(OB_TIME,value, col=name))+
+  geom_line()+
+  facet_wrap(~Name, scales = "free")+
+  # geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  xlab("time")+ylab("Wind speed (m/s)")+
+  labs(title = "High wind speed locations. 72 Hours Rolling average", color= "source")+
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, vjust = .5))+
+  scale_color_manual(values = c("eraws10" = mypal2[1], "WIND_SPEED" = mypal2[2]),
+                     labels = c("eraws10" = "ERA5", "WIND_SPEED" = "MIDAS"))
+
+ggsave(filename = file.path(annual.rev.path,"era5_midas_offstations.png"))
+```
+
+### Close to Edinburgh Gogarbank
+
+```{r northmap, fig.width=4.5, fig.height=7}
+# find 10 stations within 50 km of GOGARBANK
+station.id <- 19260 # GOGARBANK
+max.distance <- 150
+
+close.stat <- station.table.inscope %>% 
+  mutate(d.gogarbank = distGeo(
+    matrix(c(Longitude, Latitude), ncol = 2), 
+    matrix(c(Longitude[src_id == station.id], Latitude[src_id == station.id]), ncol = 2))/1e3) %>% 
+  filter(d.gogarbank<=max.distance)
+
+close.range <- close.stat[,c("Latitude","Longitude")] %>% 
+  sapply(.,range) 
+
+# Apply floor to the first row and ceiling to the second row
+close.range <- apply(close.range, 1, function(row) {
+  ifelse(row == close.range[1,], floor(row), ceiling(row))
+})
+# Load world map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+# Create a base map using ggplot
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1], close.range[2,2]) +
+  ylim(close.range[1,1], close.range[1,2]) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = close.stat, aes(x = Longitude, y = Latitude), color = "darkblue", size = 2) +#+
+  geom_text_repel(data = close.stat, aes(x = Longitude, y = Latitude, label = Name), size = 3)
+  # Add labels for stations
+  # geom_text(data = station.table, aes(x = Longitude, y = Latitude, label = Name), size = 3, vjust = 1, hjust = 1)
+
+# Print the map
+print(map)
+
+
+```
+
+```{r}
+sorted.vec <- close.stat %>% arrange(d.gogarbank) %>% pull(src_id) %>% head(10)
+# station_table_with_distances
+midas_clean %>% 
+  filter(SRC_ID %in% sorted.vec) %>% 
+  # left_join(station.table.inscope %>% select(src_id,Area),
+  #           by = c("SRC_ID"="src_id")) %>% 
+  select(OB_TIME,SRC_ID,Name,Area,Latitude,Longitude,WIND_SPEED,eraws10,bias) %>% 
+  rename(midas_ws = WIND_SPEED,
+         era5_ws = eraws10) %>% 
+  head(20) %>% 
+  kable(digits = 2) %>% 
+  kable_styling(full_width = F)
+```
+
+```{r}
+# northern stations
+
+midas.north <- midas_clean %>% 
+  filter(SRC_ID %in% close.stat$src_id) 
+midas.north %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue",alpha=0.1)+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  facet_wrap(~WIND_SPEED_UNIT_ID)+
+  xlab("ERA5")+ylab("MIDAS")+labs(title = "Wind speed comparison, observed vs reanalysis. Northern Weather Stations. 2023")+
+  theme_bw()
+```
+
+```{r}
+# northern stations with high bias
+
+ws.lm.stat <- lm(WIND_SPEED ~ eraws10:Name, 
+                 data = midas.north %>% 
+                   mutate(Name = factor(Name)))
+summary(ws.lm.stat)
+```
+
+```{r}
+excluded.stations <- c(117)
+midas.north %>% 
+  filter(!SRC_ID %in% excluded.stations) %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue",alpha=0.2)+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  facet_wrap(~WIND_SPEED_UNIT_ID)+
+  xlab("ERA5")+ylab("MIDAS")+labs(title = "Wind speed comparison, observed vs reanalysis. Northern Weather Stations. 2023")+
+  theme_bw()
+
+```
+
+#### zoom to weird slopes
+
+```{r}
+one.name <- "CAIRNGORM SUMMIT"
+one.id <- close.stat$src_id[close.stat$Name==one.name]
+
+one.dat <- midas.north %>% 
+  filter(SRC_ID %in% one.id) 
+
+one.lm <- lm(WIND_SPEED ~ eraws10, one.dat)
+
+one.dat %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue",alpha=0.2)+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = y ~ x, aes(group = 1), 
+              fullrange = TRUE) + # Add linear regression line
+  annotate("text", x = 5, y = 40, 
+           label = paste("y =", round(coef(one.lm)[1], 3),
+                         "+", round(coef(one.lm)[2], 3),
+                         "* era5"),
+           color = "black", parse = FALSE) + # Add annotation with formula
+  xlab("ERA5")+ylab("MIDAS")+
+  # coord_fixed(ratio = 1)+
+  labs(title = paste0(
+    "Wind speed comparison, observed vs reanalysis. ",
+    one.name,
+    " station. 2023"))+
+  theme_bw()
+
+```
+
+### Close to London
+
+```{r southmap, fig.width=5, fig.height=5}
+# find 10 stations within 50 km of GOGARBANK
+# station.id <- 19260 # GOGARBANK
+max.distance <- 150
+uk_center <- rev(c(51.5074, -0.1278))  # Latitude and longitude of London
+close.stat <- station.table.inscope %>% 
+  mutate(d.gogarbank = distGeo(
+    matrix(c(Longitude, Latitude), ncol = 2), 
+    matrix(c(uk_center), ncol = 2))/1e3) %>% 
+  filter(d.gogarbank<=max.distance)
+
+close.range <- close.stat[,c("Latitude","Longitude")] %>% 
+  sapply(.,range) 
+
+# Apply floor to the first row and ceiling to the second row
+close.range <- apply(close.range, 1, function(row) {
+  ifelse(row == close.range[1,], floor(row), ceiling(row))
+})
+# Load world map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+# Create a base map using ggplot
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1], close.range[2,2]) +
+  ylim(close.range[1,1], close.range[1,2]) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = close.stat, aes(x = Longitude, y = Latitude), color = "darkblue", size = 2) +#+
+  geom_text_repel(data = close.stat, aes(x = Longitude, y = Latitude, label = Name), size = 3)
+  # Add labels for stations
+  # geom_text(data = station.table, aes(x = Longitude, y = Latitude, label = Name), size = 3, vjust = 1, hjust = 1)
+
+# Print the map
+print(map)
+
+```
+
+```{r}
+# southern stations
+midas.south <- midas_clean %>% 
+  filter(SRC_ID %in% close.stat$src_id)
+midas.south %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue",alpha=0.2)+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  facet_wrap(~WIND_SPEED_UNIT_ID)+
+  xlab("ERA5")+ylab("MIDAS")+labs(title = "Wind speed comparison, observed vs reanalysis. Southern Stations. 2023")+
+  theme_bw()
+```
+
+```{r}
+ws.lm.stat <- lm(WIND_SPEED ~ eraws10:Name, 
+                 data = midas.south %>% 
+                   mutate(Name = factor(Name)))
+summary(ws.lm.stat)
+```
+
+#### zoom to weird slopes
+
+```{r}
+one.name <- "HERSTMONCEUX: WEST END"
+one.id <- close.stat$src_id[close.stat$Name==one.name]
+
+one.dat <- midas.south %>% 
+  filter(SRC_ID %in% one.id) 
+
+one.lm <- lm(WIND_SPEED ~ eraws10, one.dat)
+# summary(one.lm)
+one.dat %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue",alpha=0.2)+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = y ~ x, aes(group = 1), 
+              fullrange = TRUE) + # Add linear regression line
+  annotate("text", x = 10, y = 1, 
+           label = paste("y =", round(coef(one.lm)[1], 3),
+                         "+", round(coef(one.lm)[2], 3),
+                         "* era5"),
+           color = "black", parse = FALSE) + # Add annotation with formula
+  xlab("ERA5")+ylab("MIDAS")+
+  # coord_fixed(ratio = 1)+
+  labs(title = paste0(
+    one.name,
+    " station. 2023"))+
+  theme_bw()
+```
+
+```{r}
+one.name <- "LITTLE RISSINGTON"
+one.id <- close.stat$src_id[close.stat$Name==one.name]
+
+one.dat <- midas.south %>% 
+  filter(SRC_ID %in% one.id) 
+
+one.lm <- lm(WIND_SPEED ~ eraws10, one.dat)
+# summary(one.lm)
+one.dat %>% 
+  # slice(sample(1:nrow(midas_clean),size = 100000,replace = F)) %>% 
+  ggplot(aes(eraws10,WIND_SPEED))+
+  geom_point(col="darkblue",alpha=0.2)+
+  geom_abline(slope = 1, intercept = 0, color = "red") +  # Add 45-degree line
+  geom_smooth(method = "lm", se = FALSE, color = "black", formula = y ~ x, aes(group = 1), 
+              fullrange = TRUE) + # Add linear regression line
+  annotate("text", x = 10, y = 1, 
+           label = paste("y =", round(coef(one.lm)[1], 3),
+                         "+", round(coef(one.lm)[2], 3),
+                         "* era5"),
+           color = "black", parse = FALSE) + # Add annotation with formula
+  xlab("ERA5")+ylab("MIDAS")+
+  # coord_fixed(ratio = 1)+
+  labs(title = paste0(
+    one.name,
+    " station. 2023"))+
+  theme_bw()
+```
+
+## Orography map with stations
+
+```{r orography, fig.width=4.5, fig.height=7}
+require(elevatr)
+require(sf)
+require(rnaturalearth)
+require(raster)
+
+# Define the bounding box for the UK
+uk_bbox <- st_bbox(ne_countries(country = "United Kingdom", scale = "medium"))
+
+# Generate random locations within the bounding box of the UK
+num_locations <- 100
+loc_df <- data.frame(x = runif(num_locations, min = uk_bbox["xmin"], max = uk_bbox["xmax"]),
+                     y = runif(num_locations, min = uk_bbox["ymin"], max = uk_bbox["ymax"]))
+
+# Create an sf data frame with the same CRS as the UK boundary data
+loc_sf <- st_as_sf(loc_df, coords = c("x", "y"), crs = st_crs(ne_countries()))
+
+# Download elevation data for the random locations within the UK
+elev_data <- get_elev_raster(locations = loc_sf, z = 6)
+# Extract land elevation
+land_elev_data <- mask(elev_data, ne_countries(country = c("United Kingdom", "Ireland"), scale = "medium"))
+
+# Obtain boundary data for the United Kingdom and Ireland
+uk_and_ireland <- ne_countries(country = c("United Kingdom", "Ireland"), scale = "medium", returnclass = "sf")
+
+# Combine boundary data for the United Kingdom and Ireland
+uk_and_ireland_boundary <- st_union(uk_and_ireland)
+
+uk_ir_box <- st_as_sfc(st_bbox(uk_and_ireland_boundary))
+uk_ir_box[[1]][[1]][3,2] <- uk_ir_box[[1]][[1]][4,2] <- 62
+uk_ir_box[[1]][[1]][2,1] <-uk_ir_box[[1]][[1]][3,1] <-  6
+uk_ir_box[[1]][[1]][1,1] <-uk_ir_box[[1]][[1]][4,1] <-uk_ir_box[[1]][[1]][5,1] <- -12
+uk_ir_box[[1]][[1]][1,2] <-uk_ir_box[[1]][[1]][2,2] <-uk_ir_box[[1]][[1]][5,2] <- 48
+# Create a rectangle covering the area outside the UK and Ireland
+outside_area <- st_difference(uk_ir_box, uk_and_ireland_boundary)
+
+# Convert elevation data to a data frame
+elev_df <- as.data.frame(land_elev_data, xy = TRUE) %>% 
+  setNames(c("x","y","value"))
+
+# Plot using ggplot2
+elev.map <- ggplot() +
+  geom_raster(data = elev_df, aes(x = x, y = y, fill = value), na.rm = TRUE) +
+  scale_fill_gradientn(name = "Elevation", colours = topo.colors(10, rev = FALSE)) +
+  geom_sf(data = outside_area, fill = "lightblue") +
+  geom_point(data = station.table.inscope, aes(x = Longitude, y = Latitude), color = "red", size = 2) +
+  theme_minimal() + theme(legend.position = "inside", legend.position.inside = c(.9,.8))+
+  coord_sf(crs = st_crs(uk_and_ireland_boundary), xlim = c(-11,3), ylim = c(49,61)) +  # Set coordinate reference system
+  xlab("") + 
+  ylab("") +
+  labs(title = "Land Elevation Map of UK and Ireland")
+elev.map
+# ggsave("fig/landelevation.png",width = 5,height = 10)
+ggsave(filename = file.path(annual.rev.path,"map_stations_landelevation.png"))
+```
+
+### Get elevation
+
+```{r}
+
+# station.table.inscope
+# Generate random locations within the bounding box of the UK
+# num_locations <- 100
+stat.loc <- data.frame(x = station.table.inscope$Longitude,
+                     y = station.table.inscope$Latitude)
+
+# Create an sf data frame with the same CRS as the UK boundary data
+stat.loc_sf <- st_as_sf(stat.loc, coords = c("x", "y"), crs = st_crs(ne_countries()))
+
+# Download elevation data for the random locations within the UK
+# elev_data0 <- get_elev_raster(locations = stat.loc_sf, z = 1, clip = "bbox")
+
+elev_data0 <- get_elev_point(locations = stat.loc_sf, src = "aws")
+
+# plot(elev_data0)
+stations.welev <- cbind(station.table.inscope,elevation = elev_data0$elevation)
+
+stations.meta.fname <- file.path(data_path,"stations_meta.csv")
+write.csv(stations.welev, stations.meta.fname, row.names = FALSE)
+```
+
+```{r}
+# elevation by station
+
+stations.welev %>% 
+  # arrange(desc(elevation)) %>% 
+  ggplot()+
+  geom_histogram(aes(elevation),bins = 40, fill="darkblue")+
+  labs(title = "Histogram of Elevation (m above sea level)")+
+  ylab("station count")
+```
+
+### Elevation Northern Stations
+
+```{r}
+# find 10 stations within 50 km of GOGARBANK
+station.id <- 19260 # GOGARBANK
+max.distance <- 150
+
+close.stat <- station.table.inscope %>% 
+  mutate(d.gogarbank = distGeo(
+    matrix(c(Longitude, Latitude), ncol = 2), 
+    matrix(c(Longitude[src_id == station.id], Latitude[src_id == station.id]), ncol = 2))/1e3) %>% 
+  filter(d.gogarbank<=max.distance)
+
+close.range <- close.stat[,c("Latitude","Longitude")] %>% 
+  sapply(.,range) 
+
+# Apply floor to the first row and ceiling to the second row
+close.range <- apply(close.range, 1, function(row) {
+  ifelse(row == close.range[1,], floor(row), ceiling(row))
+})
+# Load world map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+# Create a base map using ggplot
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1], close.range[2,2]) +
+  ylim(close.range[1,1], close.range[1,2]) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = close.stat, aes(x = Longitude, y = Latitude), color = "darkblue", size = 2) +#+
+  geom_text_repel(data = close.stat, aes(x = Longitude, y = Latitude, label = Name), size = 3)
+  # Add labels for stations
+  # geom_text(data = station.table, aes(x = Longitude, y = Latitude, label = Name), size = 3, vjust = 1, hjust = 1)
+plot(map)
+```
+
+## Bias plots
+
+```{r}
+# average bias by station
+
+mean.bias <- midas_clean %>% 
+  group_by(SRC_ID,Name) %>% 
+  summarise(abs.bias = mean(abs(bias)),
+            across(c(WIND_SPEED,eraws10,bias),~mean(.,na.rm = TRUE)),
+            .groups = "drop") %>% 
+  left_join(stations.welev %>% 
+              dplyr::select(src_id,elevation),
+            by = c("SRC_ID"="src_id"))
+# view(mean.bias)
+
+bias.speed <- mean.bias %>% 
+  ggplot()+
+  geom_point(aes(WIND_SPEED,abs.bias),col = "darkblue")+
+  geom_text_repel(data = mean.bias %>%
+                    filter(WIND_SPEED>10|abs.bias>5),
+                  aes(WIND_SPEED,abs.bias,label=Name),
+                  size=3.5)+
+  coord_cartesian(ylim = c(0,10))+
+  labs(title = "Mean absolute bias by station. 2023",
+       subtitle = "Each point represents the 1YR average of 1 station")+
+  xlab("MIDAS wind speed (m/s)")+ylab("Mean absolute bias")
+
+
+bias.elev <- mean.bias %>% 
+  ggplot()+
+  geom_point(aes(elevation,abs.bias),col = "darkblue")+
+  geom_text_repel(data = mean.bias %>%
+                    filter(elevation>400),
+                  aes(elevation,abs.bias,label=Name),size=3.5)+
+  geom_text_repel(data = mean.bias %>%
+                    filter(elevation<=400, abs.bias>5),
+                  aes(elevation,abs.bias,label=Name),size=3.5)+
+  coord_cartesian(ylim = c(0,10))+
+  labs(title = "Mean absolute bias by station. 2023",
+       subtitle = "Each point represents the 1YR average of 1 station")+
+  xlab("Elevation (m above sea level)")+ylab("Mean absolute bias")
+
+speed.elev <- mean.bias %>% 
+  ggplot()+
+  geom_point(aes(elevation,WIND_SPEED),col = "darkblue")+
+  # geom_text_repel(data = mean.bias %>%
+                    # filter(elevation>400),
+                  # aes(elevation,abs.bias,label=Name),size=3.5)+
+  # geom_text_repel(data = mean.bias %>%
+                    # filter(elevation<=400, abs.bias>5),
+                  # aes(elevation,abs.bias,label=Name),size=3.5)+
+  coord_cartesian(ylim = c(0,15))+
+  labs(title = "Wind speed vs elevation by station. 2023",
+       subtitle = "Each point represents the 1YR average of 1 station")+
+  xlab("Elevation (m above sea level)")+ylab("MIDAS wind speed (m/s)")
+
+bias.speed
+ggsave(filename = file.path(annual.rev.path,"bias_speed.png"))
+bias.elev
+ggsave(filename = file.path(annual.rev.path,"bias_elev.png"))
+speed.elev
+```
+
+#### Bias scatter with variability
+
+```{r}
+mean.bias2 <- midas_clean %>% 
+  mutate(result=month(OB_TIME)) %>% 
+  group_by(SRC_ID,Name,result) %>% 
+  summarise(abs.bias = mean(abs(bias)),
+            across(c(WIND_SPEED,eraws10,bias),~mean(.,na.rm = TRUE)),
+            .groups = "drop") %>% 
+  left_join(stations.welev %>% 
+              dplyr::select(src_id,elevation),
+            by = c("SRC_ID"="src_id"))
+# view(mean.bias)
+
+mean.bias2 %>% 
+  ggplot()+
+  geom_point(aes(WIND_SPEED,abs.bias),col = "darkblue", alpha=0.5)+
+  # geom_text_repel(data = mean.bias %>%
+  #                   filter(WIND_SPEED>10|abs.bias>5),
+  #                 aes(WIND_SPEED,abs.bias,label=Name),
+  #                 size=3.5)+
+  coord_cartesian(ylim = c(0,10))+
+  labs(title = "Mean absolute bias by station. 2023",
+       subtitle = "Each point represents the 1-month average of 1 station")+
+  xlab("MIDAS wind speed (m/s)")+ylab("Mean absolute bias")
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(sf)
+
+
+
+# Calculate mean bias
+mean.bias2 <- midas_clean %>% 
+  mutate(result = month(OB_TIME)) %>% 
+  group_by(SRC_ID, Name, result) %>% 
+  summarise(abs.bias = mean(abs(bias)),
+            across(c(WIND_SPEED, eraws10, bias), ~mean(., na.rm = TRUE)),
+            .groups = "drop") %>% 
+  left_join(stations.welev %>% 
+              dplyr::select(src_id, elevation),
+            by = c("SRC_ID" = "src_id"))
+
+# Calculate centroids and convex hulls
+centroid_convex_hull <- mean.bias2 %>%
+  st_as_sf(coords = c("WIND_SPEED", "abs.bias")) %>%
+  st_set_crs(4326) %>%
+  group_by(SRC_ID) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  mutate(centroid = st_centroid(geometry),
+         hull = st_convex_hull(geometry))
+
+# Plot
+
+ggplot() +
+  geom_sf(data = centroid_convex_hull, aes(geometry = hull), fill = "#B19CD9", alpha = 0.5) +
+  geom_sf(data = centroid_convex_hull, aes(geometry = centroid), color = "darkblue", size = 2) +
+  labs(title = "Mean absolute bias by station. 2023",
+       subtitle = "Station's 1YR average + polygon of monthly means")+
+  scale_x_continuous(labels = scales::number_format())+
+  scale_y_continuous(labels = scales::number_format())+
+  xlab("MIDAS wind speed (m/s)") + ylab("Mean absolute bias")
+
+```
+
+```{r}
+# Define the function
+process_data <- function(data, time_func) {
+  data %>%
+    mutate(tgroup = time_func(OB_TIME)) %>%
+    group_by(SRC_ID, Name, tgroup) %>%
+    summarise(
+      abs.bias = mean(abs(bias)),
+      across(c(WIND_SPEED,WIND_DIRECTION, eraws10, bias), ~mean(., na.rm = TRUE)),
+      .groups = "drop"
+    )
+}
+
+# centroids function
+
+get_polygon <- function(data, x.metric = "WIND_SPEED",  y.metric = "abs.bias",...){
+  
+  # get convex hull
+  centroid_convex_hull <- data %>%
+  st_as_sf(coords = c(x.metric, y.metric)) %>%
+  st_set_crs(4326) %>%
+  group_by(SRC_ID) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  mutate(centroid = st_centroid(geometry),
+         hull = st_convex_hull(geometry))
+  
+  
+  centroid_convex_hull
+}
+
+
+plot_mean_polygons <- function(data, time_func = month,...){
+  
+  # group data and get means
+  result <- process_data(data, time_func) %>% 
+  left_join(stations.welev %>% 
+              dplyr::select(src_id, elevation),
+            by = c("SRC_ID" = "src_id"))
+  
+  # get polygons
+  convex_hull <- get_polygon(result,...)
+  
+  # Plot
+
+  fig <- ggplot() +
+    geom_sf(data = convex_hull, aes(geometry = hull), fill = "#B19CD9", alpha = 0.5) +
+    geom_sf(data = convex_hull, aes(geometry = centroid), color = "darkblue", size = 2) +
+    labs(title = "Mean absolute bias by station. 2023",...) +
+    scale_x_continuous(labels = scales::number_format())+
+    scale_y_continuous(labels = scales::number_format())+
+    xlab("MIDAS wind speed (m/s)") + ylab("Mean absolute bias")
+  print(fig)
+  invisible(fig)
+}
+
+  
+# process_data(midas_clean, month) %>% 
+#   get_polygon
+
+
+myfig <- plot_mean_polygons(midas_clean, month, subtitle = "Station's 1YR average + polygon of monthly means")
+plot_mean_polygons(midas_clean, date, subtitle = "Station's 1YR average + polygon of daily means")
+plot_mean_polygons(midas_clean, hour, subtitle = "Station's 1YR average + polygon of hour of day means")
+# process_data(midas_clean,month)
+# process_data(midas_clean,date)
+
+
+```
+
+```{r}
+plot_mean_polygons(midas_clean, y.metric = "bias", month, subtitle = "Station's 1YR average + polygon of monthly means")
+plot_mean_polygons(midas_clean, y.metric = "bias", date, subtitle = "Station's 1YR average + polygon of daily means")
+plot_mean_polygons(midas_clean, y.metric = "bias", hour, subtitle = "Station's 1YR average + polygon of hour of day means")
+```
+
+```{r}
+myfig <- plot_mean_polygons(
+  midas_clean,
+  x.metric = "WIND_DIRECTION", 
+  y.metric = "bias", month, subtitle = "Station's 1YR average + polygon of monthly means")
+myfig +
+  coord_sf(xlim = c(-180,-130))
+
+
+```
+
+#### Bias map
+
+```{r biasmap, fig.width=4.5, fig.height=7}
+#CCEEF9
+#59C7EB
+bias.map <- ggplot() +
+  geom_raster(data = elev_df, aes(x = x, y = y, fill = value), na.rm = TRUE) +
+  scale_fill_gradientn(name = "Elevation", colours = topo.colors(10, rev = FALSE)) +
+  geom_sf(data = outside_area, fill = "#CCEEF9") +
+  geom_point(data = station.table.inscope %>% 
+               # joining with avg bias
+               left_join(
+                 process_data(midas_clean,year),
+                 by = c("src_id"="SRC_ID"),
+                 suffix = c("", ".2")
+               ), 
+             aes(x = Longitude, y = Latitude, size = abs.bias), 
+             shape = 21, 
+             color = "white",
+             fill = "#4B0082") +
+  theme_minimal() + theme(legend.position = "inside", legend.position.inside = c(.9,.8))+
+  coord_sf(crs = st_crs(uk_and_ireland_boundary), xlim = c(-11,3), ylim = c(49,61)) +  # Set coordinate reference system
+  xlab("") + 
+  ylab("") +
+  labs(title = "Land Elevation Map of UK and Ireland")
+bias.map
+
+# view(mean.bias)
+```
+
+```{r rawbiasmap, fig.width=4.5, fig.height=7}
+bias.data <- station.table.inscope %>% 
+               # joining with avg bias
+               left_join(
+                 process_data(midas_clean,year),
+                 by = c("src_id"="SRC_ID"),
+                 suffix = c("", ".2")
+               ) %>% 
+  mutate(
+    bias_category = cut(
+      bias,
+      breaks = c(-3, -0.5,0.5, 3, Inf),
+      labels = c("-3 to -0.5", "-0.5 to 0.5", "0.5 to 3", "more"),
+      right = FALSE
+    )
+  )
+
+
+bias.map <- ggplot() +
+  geom_raster(data = elev_df, aes(x = x, y = y, fill = value), na.rm = TRUE) +
+  scale_fill_gradientn(name = "Elevation", colours = topo.colors(10, rev = FALSE)) +
+  geom_sf(data = outside_area, fill = "#CCEEF9") +
+  geom_point(data = bias.data, 
+             aes(x = Longitude, y = Latitude, size = bias_category), 
+             shape = 21, 
+             color = "white",
+             fill = "#4B0082") +
+  scale_size_manual(
+    name = "Bias",
+    values = c("-3 to -0.5" = 2, "-0.5 to 0.5" = 3, "0.5 to 3" = 4, "more" = 5),
+    drop = FALSE
+  ) +
+  theme_minimal() + theme(legend.position = "inside", legend.position.inside = c(.9,.7))+
+  coord_sf(crs = st_crs(uk_and_ireland_boundary), xlim = c(-11,3), ylim = c(49,61)) +  # Set coordinate reference system
+  xlab("") + 
+  ylab("") +
+  labs(title = "ERA5 Bias & Land Elevation Map")
+bias.map
+```
+
+
+```{r rawbiasmap, fig.width=4.5, fig.height=7}
+ggplotly(bias.map)
+```
+
+```{r}
+# process_data(midas_clean,year) %>% view()
+```
+
+#### Locations with really low bias. Double check
+
+#### Maps showing other variables
+
+#### Bias and spatial aggregation
+
+#### Quantile matching
+
+```{r}
+require(qmap)
+qmap::fitQmap()
+```
+
+## Bias correction
+
+### LM
+
+```{r}
+ws.lm.stat <- lm(WIND_SPEED ~ eraws10:Name, 
+                 data = midas_clean %>% 
+                   filter(SRC_ID %in% mean.bias$SRC_ID[mean.bias$abs.bias>2.5]) %>% 
+                   mutate(Name = factor(Name)))
+summary(ws.lm.stat)
+```
+
+```{r}
+ws.lm.stat <- lm(WIND_SPEED ~ elevation +
+                   mean.ws+
+                   eraws10:Name, 
+                 data = midas_clean %>% 
+                   filter(SRC_ID %in% mean.bias$SRC_ID[mean.bias$abs.bias>2.5]) %>% 
+                   left_join(mean.bias %>% 
+                               dplyr::select(SRC_ID,bias,abs.bias,WIND_SPEED,elevation) %>% 
+                               rename(mean.ws = WIND_SPEED),
+                             by = c("SRC_ID")) %>% 
+                   mutate(Name = factor(Name)))
+summary(ws.lm.stat)
+```
+
+```{r}
+require(mgcv)
+require(splines)
+ws.gam <- gam(WIND_SPEED ~ elevation +
+                   bs(mean.ws, knots = seq(0,15,6), df = 2)+
+                   eraws10:Name, 
+                 data = midas_clean %>% 
+                   filter(SRC_ID %in% mean.bias$SRC_ID[mean.bias$abs.bias>2.5]) %>% 
+                   left_join(mean.bias %>% 
+                               dplyr::select(SRC_ID,bias,abs.bias,WIND_SPEED,elevation) %>% 
+                               rename(mean.ws = WIND_SPEED),
+                             by = c("SRC_ID")) %>% 
+                   mutate(Name = factor(Name)))
+summary(ws.gam)
+```
+
+```{r}
+dredge()
+glm()
+nls
+out <- sapply(models, function(m) {
+    c(p = length(coef(m)),
+      loglik = logLik(m),
+      AIC = AIC(m),
+      BIC = BIC(m))
+})
+
+nmle
+
+```
+
+### Quantile matching
+
+### Spatial modelling
+
+```{r }
+# install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/testing"), dep=TRUE)
+require(INLA)
+
+t.sample <- as.POSIXct("2023-05-23 11:00:00", tz = "UTC")
+
+df.sample <- midas_clean %>% 
+  filter(OB_TIME %in% t.sample) %>% 
+  left_join(
+    stations.welev %>% 
+      dplyr::select(src_id,elevation),
+    by = c("SRC_ID"="src_id")
+  )
+station.table.inscope2 <- station.table.inscope %>% 
+  filter(src_id %in% df.sample$SRC_ID)
+# process_data(df.sample,hour)
+
+# station.table.inscope
+
+# loc.mesh <- inla.mesh.2d(
+#   station.table.inscope2 %>% dplyr::select(Longitude,Latitude),
+#   max.edge = c(1,10)
+# )
+loc.mesh <- fmesher::fm_mesh_2d_inla(
+  station.table.inscope2 %>% dplyr::select(Longitude,Latitude),
+  max.edge = c(1,2)
+  )
+
+
+
+
+```
+
+```{r mesh0, fig.width=4.5, fig.height=5}
+# Locations <- station.table.inscope2 %>% dplyr::select(Longitude,Latitude) # creates error in make.A
+Locations <- cbind(station.table.inscope2$Longitude,
+                   station.table.inscope2$Latitude)
+stepsize <- 4 * 1 / 70 # each degree is approximately 70km near london. So we're creating a grid of 4km
+x.range <- diff(range(Locations[, 1]))
+y.range <- diff(range(Locations[, 2]))
+nxy <- round(c(x.range, y.range) / stepsize)
+
+bound2 <- inla.nonconvex.hull(Locations, convex = -0.15, concave = 0.5)
+
+
+# Generate the INLA mesh
+loc.mesh <-  fmesher::fm_mesh_2d_inla(
+  Locations,
+  max.edge = c(0.5,2)
+)
+plot(loc.mesh)
+title("INLA Mesh for Bias Model")
+# loc.mesh <- inla.mesh.2d(
+#   Locations,
+#   max.edge = c(0.5,2)
+# )
+loc.mesh <- inla.mesh.2d(
+  boundary = bound2, 
+  # cutoff = 0.05,
+  max.edge = c(0.5, 1)
+  )
+plot(loc.mesh)
+title("INLA Mesh for Bias Model")
+
+```
+
+```{r mapwgrid, fig.height=7, fig.width=4.5}
+# Convert mesh to a data frame for plotting
+mesh_df <- data.frame(
+  x = loc.mesh$loc[,1],
+  y = loc.mesh$loc[,2]
+)
+
+# Extract mesh vertices and edges
+vertices <- loc.mesh$loc
+triangles <- loc.mesh$graph$tv
+# Create a data frame for the edges
+edges_df <- data.frame(
+  x = c(vertices[triangles[,1], 1], vertices[triangles[,2], 1], NA, 
+        vertices[triangles[,2], 1], vertices[triangles[,3], 1], NA, 
+        vertices[triangles[,3], 1], vertices[triangles[,1], 1], NA),
+  y = c(vertices[triangles[,1], 2], vertices[triangles[,2], 2], NA,
+        vertices[triangles[,2], 2], vertices[triangles[,3], 2], NA,
+        vertices[triangles[,3], 2], vertices[triangles[,1], 2], NA)
+)
+# Generate the base map
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1]-3, close.range[2,2]+3) +
+  ylim(close.range[1,1]-2, close.range[1,2]+2) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = station.table.inscope %>% 
+               # Joining with avg bias
+               left_join(
+                 process_data(midas_clean, year),
+                 by = c("src_id"="SRC_ID"),
+                 suffix = c("", ".2")
+               ), 
+             aes(x = Longitude, y = Latitude, size = bias), 
+             shape = 21, 
+             color = "black",
+             fill = "darkorange")
+
+# Plot the INLA mesh on top of the map
+final_plot <- map +
+  # geom_path(data = edges_df, aes(x = x, y = y), color = "lightgray",size=0.3,alpha=0.1) +
+  geom_point(data = mesh_df, aes(x = x, y = y), color = "blue", size=0.4, alpha=0.8) +
+  ggtitle("INLA Mesh Overlay on Map")+
+  theme(legend.position = "inside",legend.position.inside = c(0.1,0.8))
+
+# Display the final plot
+print(final_plot)
+
+```
+
+```{r}
+# Creating A matrix (Observation/prediction matrix)
+loc.A <- inla.spde.make.A(loc.mesh, loc = Locations)
+#Creating Matern SPDE model object with PC prior
+loc.spde = inla.spde2.pcmatern(mesh = loc.mesh,
+prior.range = c(1, 0.5),
+prior.sigma = c(1, 0.5))
+#Generating the SPDE model index vector
+loc.w <- inla.spde.make.index('w', n.spde = loc.spde$n.spde)
+```
+
+```{r}
+# projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]), 
+#   ylim = range(Locations[, 2]), dims = nxy)
+
+projgrid <- inla.mesh.projector(loc.mesh, xlim = range(Locations[, 1]), 
+  ylim = range(Locations[, 2]))
+```
+
+```{r}
+#First we make the model matrix using the model formula,
+#but without response and intercept.
+X0 <- model.matrix( ~ 0 + WIND_SPEED + elevation, data = df.sample)
+
+X <- as.data.frame(X0) # convert to a data frame.
+# Making the stack
+N <- nrow(df.sample) #Saving the number of rows in the data
+
+Stackcalib <- inla.stack(
+# specify the response variable
+data = list(y = df.sample$bias),
+# Vector of Multiplication factors for fixed effects
+A = list(1, 1, loc.A),
+#Specify the fixed and random effects
+effects = list(
+# specify the manual intercept!
+Intercept = rep(1, N),
+# attach the model matrix
+X = X,
+# attach the w
+w = loc.w) )
+```
+
+```{r}
+m.I2 <- inla(y ~ 0 + Intercept + WIND_SPEED + elevation +
+  f(w, model = loc.spde),
+family = "Gaussian",
+data = inla.stack.data(Stackcalib),
+control.compute = list(cpo=T,dic = T),
+control.predictor = list(A = inla.stack.A(Stackcalib)))
+
+# m.I2$summary.random$w
+xmean <- inla.mesh.project(projgrid,
+  m.I2$summary.random$w$mean)
+xsd <- inla.mesh.project(projgrid, m.I2$summary.random$w$sd)
+```
+
+```{r}
+summary(m.I2)
+```
+
+```{r diagnosticplot, fig.width=12, fig.size=10}
+par(mfrow = c(4,4))
+
+# plot(m.I2)
+
+```
+
+```{r}
+m.I2.nlscpo=-sum(log(m.I2$cpo$cpo))
+cat("NLSCPO of INLA model 2:",m.I2.nlscpo,"\n")
+cat("DIC of INLA model 2:",m.I2$dic$dic,"\n")
+cat("Standard deviation of mean residuals for INLA model 2:",
+    sd(df.sample$bias-m.I2$summary.fitted.values$mean[1:N]),"\n")
+```
+
+```{r}
+m.I2.nlscpo=-sum(log(m.I2$cpo$cpo))
+cat("NLSCPO of INLA model 2:",m.I2.nlscpo,"\n")
+cat("DIC of INLA model 2:",m.I2$dic$dic,"\n")
+cat("Standard deviation of mean residuals for INLA model 2:",
+    sd(df.sample$bias-m.I2$summary.fitted.values$mean[1:N]),"\n")
+```
+
+```{r spatialeff}
+if(!require(ggregplot)){
+    devtools::install_github("gfalbery/ggregplot")
+    library(ggregplot)
+}
+# library(ggplot2) 
+# library(tidyverse)
+library(RColorBrewer)
+
+ggField(m.I2, loc.mesh, Groups = 1,Res=600) + scale_fill_brewer(palette = "Blues")
+```
+
+```{r}
+# library(grid)
+
+# Create the ggField plot
+ggfield_plot <- ggField(m.I2, loc.mesh, Groups = 1, Res = 600) + 
+  scale_fill_brewer(palette = "Blues")
+
+# Convert the ggField plot to a grob
+ggfield_grob <- ggplotGrob(ggfield_plot)
+
+
+close.range <- station.table.inscope[,c("Latitude","Longitude")] %>% 
+  sapply(.,range) 
+
+# Apply floor to the first row and ceiling to the second row
+close.range <- apply(close.range, 1, function(row) {
+  ifelse(row == close.range[1,], floor(row), ceiling(row))
+})
+# Load world map data
+world <- ne_countries(scale = "medium", returnclass = "sf")
+# Create a base map using ggplot
+map <- ggplot() +
+  # Set the limits for longitude and latitude
+  xlim(close.range[2,1], close.range[2,2]) +
+  ylim(close.range[1,1], close.range[1,2]) +
+  # Add coastlines
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray") +
+  # Add stations as points
+  geom_point(data = station.table.inscope %>% 
+               # joining with avg bias
+               left_join(
+                 process_data(midas_clean,year),
+                 by = c("src_id"="SRC_ID"),
+                 suffix = c("", ".2")
+               ), 
+             aes(x = Longitude, y = Latitude, size = bias), 
+             shape = 21, 
+             color = "black",
+             fill = "darkorange")
+
+# Add the ggField plot as a new layer
+final_plot <- map + 
+  annotation_custom(ggfield_grob, 
+                    xmin = close.range[2, 1], xmax = close.range[2, 2], 
+                    ymin = close.range[1, 1], ymax = close.range[1, 2])
+
+# Print the final plot
+print(final_plot)
+
+# Print the map
+print(map)
+```
+
+```{r}
+ ggfield_plot +
+   coord_sf()  +# Ensure the plot uses the geographic coordinate system
+  geom_sf(data = world, color = "black", size = 0.5, fill = "lightgray")
+ 
+ 
+plot(m.I2)
+```
+
+### Spatiotemporal
